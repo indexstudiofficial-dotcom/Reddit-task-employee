@@ -1,33 +1,124 @@
 // ============================================================
 // REDDIT TASK EMPLOYEE
-// Cloudflare Worker
-//
-// GET  /health
-// POST /cron
-//
-// Required secrets:
-// SUPABASE_URL
-// SUPABASE_SERVICE_ROLE_KEY
-// COMPOSIO_API_KEY
-//
-// No AI is used.
+// Cloudflare Worker + Supabase + Composio
 // ============================================================
 
 const WORKER_NAME = "reddit-task-employee";
 
-const COMPOSIO_API_BASE =
-  "https://backend.composio.dev/api/v3.1";
+const COMPOSIO_API_BASE = "https://backend.composio.dev/api/v3.1";
 
-const REDDIT_SEARCH_TOOL =
-  "REDDIT_SEARCH_ACROSS_SUBREDDITS";
+const REDDIT_SEARCH_TOOL = "REDDIT_SEARCH_ACROSS_SUBREDDITS";
 
-const TOTAL_POSTS_PER_TASK = 5;
-const MAX_POST_AGE_DAYS = 90;
+// Task requirements
+const POSTS_PER_TASK = 5;
 const MAX_SEARCH_RESULTS = 100;
+const MAX_POST_AGE_DAYS = 90;
 const MIN_RELEVANCE_SCORE = 15;
 
+// Claim stale processing tasks again after 15 minutes.
+const STALE_TASK_MINUTES = 15;
+
 // ============================================================
-// RESPONSE HELPERS
+// MAIN REQUEST HANDLER
+// ============================================================
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      return jsonResponse({
+        success: true,
+        worker: WORKER_NAME,
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (request.method !== "POST" || url.pathname !== "/cron") {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Not found. Use GET /health or POST /cron.",
+        },
+        404
+      );
+    }
+
+    // Optional cron authentication.
+    if (env.CRON_SECRET) {
+      const suppliedSecret = request.headers.get("x-cron-secret");
+
+      if (suppliedSecret !== env.CRON_SECRET) {
+        return jsonResponse(
+          {
+            success: false,
+            error: "Unauthorized",
+          },
+          401
+        );
+      }
+    }
+
+    try {
+      validateEnvironment(env);
+
+      const task = await claimNextTask(env);
+
+      if (!task) {
+        return jsonResponse({
+          success: true,
+          worker: WORKER_NAME,
+          message: "No eligible Reddit tasks found.",
+          processed: false,
+        });
+      }
+
+      const result = await processTask(env, task);
+
+      return jsonResponse({
+        success: true,
+        worker: WORKER_NAME,
+        processed: true,
+        ...result,
+      });
+    } catch (error) {
+      console.error("Worker error:", errorMessage(error));
+
+      return jsonResponse(
+        {
+          success: false,
+          worker: WORKER_NAME,
+          error: errorMessage(error),
+        },
+        500
+      );
+    }
+  },
+};
+
+// ============================================================
+// ENVIRONMENT VALIDATION
+// ============================================================
+
+function validateEnvironment(env) {
+  const required = [
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "COMPOSIO_API_KEY",
+  ];
+
+  const missing = required.filter((name) => !env[name]);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing Cloudflare Worker secrets: ${missing.join(", ")}`
+    );
+  }
+}
+
+// ============================================================
+// JSON RESPONSE
 // ============================================================
 
 function jsonResponse(data, status = 200) {
@@ -40,40 +131,79 @@ function jsonResponse(data, status = 200) {
   });
 }
 
+// ============================================================
+// GENERAL HELPERS
+// ============================================================
+
 function errorMessage(error) {
-  return error instanceof Error
-    ? error.message
-    : String(error);
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function asString(value) {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function normalizeSubreddit(value) {
+  return asString(value)
+    .trim()
+    .replace(/^https?:\/\/(?:www\.)?reddit\.com\/r\//i, "")
+    .replace(/^\/?r\//i, "")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+function normalizeText(value) {
+  return asString(value)
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // ============================================================
-// SUPABASE REST API
+// SUPABASE REST REQUEST HELPER
 // ============================================================
 
-async function supabaseRequest(env, path, options = {}) {
-  const baseUrl = env.SUPABASE_URL?.replace(/\/+$/, "");
-  const serviceKey = env.SUPABASE_SERVICE_ROLE_KEY;
+async function supabaseRequest(
+  env,
+  table,
+  {
+    method = "GET",
+    query = "",
+    body,
+    prefer,
+  } = {}
+) {
+  const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
 
-  if (!baseUrl || !serviceKey) {
-    throw new Error(
-      "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY"
-    );
+  const url = `${baseUrl}/rest/v1/${table}${query ? `?${query}` : ""}`;
+
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    Accept: "application/json",
+  };
+
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
   }
 
-  const response = await fetch(`${baseUrl}${path}`, {
-    method: options.method || "GET",
+  if (prefer) {
+    headers.Prefer = prefer;
+  }
 
-    headers: {
-      apikey: serviceKey,
-      Authorization: `Bearer ${serviceKey}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-
-    body:
-      options.body === undefined
-        ? undefined
-        : JSON.stringify(options.body),
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
 
   const text = await response.text();
@@ -89,184 +219,514 @@ async function supabaseRequest(env, path, options = {}) {
   }
 
   if (!response.ok) {
+    const detail =
+      typeof data === "string" ? data : JSON.stringify(data);
+
     throw new Error(
-      `Supabase request failed (${response.status}): ` +
-      `${typeof data === "string" ? data : JSON.stringify(data)}`
+      `Supabase ${method} ${table} failed (${response.status}): ${detail}`
     );
   }
 
-  return {
-    data,
-    headers: response.headers,
-  };
+  return data;
+}
+
+// ============================================================
+// CLAIM NEXT TASK
+// ============================================================
+
+async function claimNextTask(env) {
+  const staleBefore = new Date(
+    Date.now() - STALE_TASK_MINUTES * 60 * 1000
+  ).toISOString();
+
+  const query = new URLSearchParams({
+    select: "*",
+    worker_type: "eq.reddit_research",
+    source: "eq.reddit",
+    pending_count: "gt.0",
+    order: "created_at.desc",
+    limit: "20",
+  });
+
+  const tasks = await supabaseRequest(env, "planner_runs", {
+    query: query.toString(),
+  });
+
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return null;
+  }
+
+  for (const task of tasks) {
+    const status = asString(task.status).toLowerCase();
+
+    const isPending =
+      status === "pending" ||
+      status === "" ||
+      status === "queued";
+
+    const isStaleProcessing =
+      status === "processing" &&
+      task.started_at &&
+      new Date(task.started_at).getTime() <
+        new Date(staleBefore).getTime();
+
+    if (!isPending && !isStaleProcessing) {
+      continue;
+    }
+
+    // Optimistic claim: only claim if the task still has the
+    // status and pending count that we originally read.
+    const claimQuery = new URLSearchParams({
+      id: `eq.${task.id}`,
+      pending_count: "gt.0",
+    });
+
+    if (isPending) {
+      if (status === "") {
+        claimQuery.set("status", "is.null");
+      } else {
+        claimQuery.set("status", `eq.${task.status}`);
+      }
+    } else {
+      claimQuery.set("status", "eq.processing");
+      claimQuery.set("started_at", `lt.${staleBefore}`);
+    }
+
+    const claimed = await supabaseRequest(env, "planner_runs", {
+      method: "PATCH",
+      query: claimQuery.toString(),
+      body: {
+        status: "processing",
+        started_at: new Date().toISOString(),
+        error: null,
+      },
+      prefer: "return=representation",
+    });
+
+    if (Array.isArray(claimed) && claimed.length > 0) {
+      return claimed[0];
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// PROCESS TASK
+// ============================================================
+
+async function processTask(env, task) {
+  try {
+    if (!task.user_id) {
+      throw new Error("Task is missing user_id.");
+    }
+
+    if (!task.application_id) {
+      throw new Error("Task is missing application_id.");
+    }
+
+    const taskDetails = parseTask(task.task);
+
+    if (taskDetails.queries.length === 0) {
+      throw new Error(
+        "No search queries found in the task. Add a Search Queries section."
+      );
+    }
+
+    if (taskDetails.subreddits.length === 0) {
+      throw new Error(
+        "No subreddits found in the task. Add a Recommended Subreddits section."
+      );
+    }
+
+    // Find the user's Reddit connection for this application.
+    const connection = await getRedditConnection(
+      env,
+      task.user_id,
+      task.application_id
+    );
+
+    if (!connection) {
+      throw new Error(
+        "No active Reddit connection found for this user and application."
+      );
+    }
+
+    // Use the number of posts already saved for this task.
+    const existingPosts = await getExistingResults(env, task.id);
+
+    const existingIds = new Set(
+      existingPosts.map((post) => asString(post.reddit_post_id))
+    );
+
+    const remaining = Math.max(
+      0,
+      POSTS_PER_TASK - existingPosts.length
+    );
+
+    if (remaining === 0) {
+      await updateTaskProgress(env, task, existingPosts.length);
+
+      return {
+        task_id: task.id,
+        message: "Task already has five saved Reddit posts.",
+        saved_count: existingPosts.length,
+        pending_count: 0,
+        status: "Completed",
+      };
+    }
+
+    const queryIndex = Math.min(
+      POSTS_PER_TASK - remaining,
+      taskDetails.queries.length - 1
+    );
+
+    const searchQuery =
+      taskDetails.queries[queryIndex] || taskDetails.queries[0];
+
+    const primarySubredditIndex = Math.min(
+      POSTS_PER_TASK - remaining,
+      taskDetails.subreddits.length - 1
+    );
+
+    const primarySubreddit =
+      taskDetails.subreddits[primarySubredditIndex] ||
+      taskDetails.subreddits[0];
+
+    // Search the primary subreddit first, then other subreddits
+    // if we do not find a suitable new post.
+    const subredditOrder = [
+      primarySubreddit,
+      ...taskDetails.subreddits.filter(
+        (name) => name.toLowerCase() !== primarySubreddit.toLowerCase()
+      ),
+    ];
+
+    const foundPosts = [];
+    const seenThisRun = new Set(existingIds);
+
+    for (const subreddit of subredditOrder) {
+      if (foundPosts.length >= remaining) {
+        break;
+      }
+
+      const rawResponse = await executeComposioTool(
+        env,
+        connection.connection_id,
+        {
+          // IMPORTANT: Composio requires search_query, NOT query.
+          search_query: searchQuery,
+          subreddit,
+          sort: "new",
+          time_filter: "all",
+          limit: MAX_SEARCH_RESULTS,
+        },
+        task.user_id
+      );
+
+      const normalizedPosts = extractPosts(rawResponse);
+
+      const eligiblePosts = normalizedPosts
+        .map((post) =>
+          normalizePost(post, subreddit, searchQuery, taskDetails.niche)
+        )
+        .filter(Boolean)
+        .filter((post) => isWithinAgeLimit(post.created_utc))
+        .filter((post) => !seenThisRun.has(post.reddit_post_id))
+        .filter(
+          (post) => post.relevance_score >= MIN_RELEVANCE_SCORE
+        );
+
+      eligiblePosts.sort(
+        (a, b) => b.created_utc - a.created_utc
+      );
+
+      for (const post of eligiblePosts) {
+        if (foundPosts.length >= remaining) {
+          break;
+        }
+
+        if (seenThisRun.has(post.reddit_post_id)) {
+          continue;
+        }
+
+        seenThisRun.add(post.reddit_post_id);
+        foundPosts.push(post);
+      }
+
+      // Avoid hammering Composio when trying multiple subreddits.
+      await sleep(200);
+    }
+
+    let savedCount = 0;
+
+    if (foundPosts.length > 0) {
+      savedCount = await saveResults(
+        env,
+        task,
+        foundPosts
+      );
+    }
+
+    // Re-read results after insertion to calculate the true total.
+    const allResults = await getExistingResults(env, task.id);
+
+    await updateTaskProgress(env, task, allResults.length);
+
+    const completed = allResults.length >= POSTS_PER_TASK;
+
+    return {
+      task_id: task.id,
+      niche: taskDetails.niche || task.niche || null,
+      matched_query: searchQuery,
+      searched_subreddit: primarySubreddit,
+      found_count: foundPosts.length,
+      saved_count_this_run: savedCount,
+      total_saved_count: allResults.length,
+      pending_count: Math.max(
+        0,
+        POSTS_PER_TASK - allResults.length
+      ),
+      status: completed ? "Completed" : "pending",
+      message: completed
+        ? "Task completed with five saved Reddit posts."
+        : foundPosts.length === 0
+          ? "No new qualifying Reddit posts found. Task remains pending."
+          : "Results saved. More posts are still needed.",
+    };
+  } catch (error) {
+    console.error(
+      `Task ${task.id} failed:`,
+      errorMessage(error)
+    );
+
+    // Return the task to pending so a future cron run can retry.
+    // The error is retained for debugging.
+    await markTaskFailed(env, task, errorMessage(error));
+
+    return {
+      success: false,
+      task_id: task.id,
+      error: errorMessage(error),
+      status: "pending",
+    };
+  }
+}
+
+// ============================================================
+// FIND REDDIT CONNECTION
+// ============================================================
+
+async function getRedditConnection(
+  env,
+  userId,
+  applicationId
+) {
+  const query = new URLSearchParams({
+    select: "id,user_id,application_id,integration_id,connection_id,status",
+    user_id: `eq.${userId}`,
+    application_id: `eq.${applicationId}`,
+    integration_id: "eq.reddit",
+    order: "updated_at.desc",
+    limit: "20",
+  });
+
+  const rows = await supabaseRequest(env, "user_integrations", {
+    query: query.toString(),
+  });
+
+  if (!Array.isArray(rows)) {
+    return null;
+  }
+
+  return (
+    rows.find((row) => {
+      const status = asString(row.status).toLowerCase();
+
+      return (
+        row.connection_id &&
+        (status === "connected" || status === "active")
+      );
+    }) || null
+  );
 }
 
 // ============================================================
 // COMPOSIO TOOL EXECUTION
-//
-// FIX: Composio requires BOTH:
-// connected_account_id
-// entity_id
-//
-// entity_id is the user identifier associated with the
-// connected account.
 // ============================================================
 
 async function executeComposioTool(
   env,
   connectionId,
-  toolSlug,
   argumentsObject,
   userId
 ) {
-  if (!env.COMPOSIO_API_KEY) {
-    throw new Error("Missing COMPOSIO_API_KEY secret");
-  }
-
   if (!connectionId) {
-    throw new Error("Composio connection ID is missing");
+    throw new Error("Composio connection_id is missing.");
   }
 
   if (!userId) {
-    throw new Error(
-      "Composio entity_id is missing: task.user_id is empty"
-    );
+    throw new Error("Composio entity_id/user ID is missing.");
   }
 
-  const url =
-    `${COMPOSIO_API_BASE}/tools/execute/` +
-    encodeURIComponent(toolSlug);
+  const url = `${COMPOSIO_API_BASE}/tools/execute/${REDDIT_SEARCH_TOOL}`;
 
   const response = await fetch(url, {
     method: "POST",
-
     headers: {
       "Content-Type": "application/json",
       "x-api-key": env.COMPOSIO_API_KEY,
     },
-
     body: JSON.stringify({
       connected_account_id: connectionId,
 
-      // Required by the error returned by Composio.
+      // Required by Composio for connected-account execution.
       entity_id: String(userId),
 
       version: "latest",
-
       arguments: argumentsObject,
     }),
   });
 
-  const text = await response.text();
+  const responseText = await response.text();
 
   let result;
 
   try {
-    result = text ? JSON.parse(text) : {};
+    result = responseText ? JSON.parse(responseText) : {};
   } catch {
-    throw new Error(
-      `Composio returned invalid JSON: ${text.slice(0, 800)}`
-    );
+    result = responseText;
   }
 
   if (!response.ok) {
     throw new Error(
-      `Composio tool ${toolSlug} failed ` +
-      `(${response.status}): ` +
-      JSON.stringify(result).slice(0, 1800)
+      `Composio tool ${REDDIT_SEARCH_TOOL} failed (${response.status}): ${
+        typeof result === "string"
+          ? result
+          : JSON.stringify(result)
+      }`
     );
   }
 
-  if (result.successful === false) {
-    throw new Error(
-      `Composio tool ${toolSlug} failed: ` +
-      JSON.stringify(result.error || result).slice(0, 1800)
-    );
-  }
+  // Some integrations can return an HTTP-success response whose
+  // JSON body reports an execution error.
+  if (result && typeof result === "object") {
+    if (result.error) {
+      throw new Error(
+        `Composio tool ${REDDIT_SEARCH_TOOL} failed: ${
+          typeof result.error === "string"
+            ? result.error
+            : JSON.stringify(result.error)
+        }`
+      );
+    }
 
-  if (result.error && !result.data) {
-    throw new Error(
-      `Composio tool ${toolSlug} failed: ` +
-      JSON.stringify(result.error).slice(0, 1800)
-    );
+    if (
+      result.success === false ||
+      result.successful === false
+    ) {
+      throw new Error(
+        `Composio tool ${REDDIT_SEARCH_TOOL} execution failed: ${JSON.stringify(
+          result
+        )}`
+      );
+    }
   }
 
   return result;
 }
 
 // ============================================================
-// REDDIT CONNECTION LOOKUP
-//
-// Your database status is "connected", not just "active".
-// Match the same user and application as the task.
+// PARSE TASK TEXT
 // ============================================================
 
-async function getRedditConnection(env, task) {
-  if (!task.user_id || !task.application_id) {
-    throw new Error(
-      "Task is missing user_id or application_id"
-    );
+function parseTask(rawTask) {
+  if (rawTask && typeof rawTask === "object") {
+    return {
+      niche: asString(
+        rawTask.niche || rawTask.customer_niche
+      ),
+      subreddits: normalizeSubreddits(
+        rawTask.subreddits ||
+          rawTask.recommended_subreddits ||
+          []
+      ),
+      queries: normalizeQueries(
+        rawTask.queries || rawTask.search_queries || []
+      ),
+    };
   }
 
-  const params = new URLSearchParams({
-    select:
-      "id,user_id,application_id,integration_id," +
-      "connection_id,status",
+  const text = asString(rawTask);
+  const lines = text.split(/\r?\n/);
 
-    user_id: `eq.${task.user_id}`,
+  let niche = "";
+  let section = "";
+  const subreddits = [];
+  const queries = [];
 
-    application_id: `eq.${task.application_id}`,
+  for (const originalLine of lines) {
+    const line = originalLine.trim();
 
-    order: "updated_at.desc",
+    if (!line) {
+      continue;
+    }
 
-    limit: "50",
-  });
-
-  const response = await supabaseRequest(
-    env,
-    `/rest/v1/user_integrations?${params.toString()}`
-  );
-
-  if (!Array.isArray(response.data)) {
-    throw new Error(
-      "Unexpected response from user_integrations"
+    const nicheMatch = line.match(
+      /^customer\s+niche\s*:\s*(.+)$/i
     );
+
+    if (nicheMatch) {
+      niche = nicheMatch[1].trim();
+      continue;
+    }
+
+    if (/^(recommended\s+subreddits|subreddits)\s*:/i.test(line)) {
+      section = "subreddits";
+      continue;
+    }
+
+    if (/^(search\s+queries|queries)\s*:/i.test(line)) {
+      section = "queries";
+      continue;
+    }
+
+    if (
+      /^(objective|goal|instructions|description|task)\s*:/i.test(
+        line
+      )
+    ) {
+      section = "";
+      continue;
+    }
+
+    const bulletMatch = line.match(/^(?:[-*•]|\d+[.)])\s*(.+)$/);
+
+    const value = bulletMatch
+      ? bulletMatch[1].trim()
+      : line;
+
+    if (section === "subreddits") {
+      const subreddit = normalizeSubreddit(value);
+
+      if (subreddit) {
+        subreddits.push(subreddit);
+      }
+    } else if (section === "queries") {
+      const query = value.trim();
+
+      if (query) {
+        queries.push(query);
+      }
+    }
   }
 
-  const connection = response.data.find((row) => {
-    const integrationId = String(
-      row.integration_id || ""
-    ).toLowerCase();
-
-    const status = String(
-      row.status || ""
-    ).toLowerCase();
-
-    return (
-      integrationId === "reddit" &&
-      Boolean(row.connection_id) &&
-      ["connected", "active"].includes(status)
-    );
-  });
-
-  if (!connection) {
-    throw new Error(
-      "No connected Reddit integration found for " +
-      `user_id=${task.user_id}, ` +
-      `application_id=${task.application_id}. ` +
-      `Rows returned=${response.data.length}`
-    );
-  }
-
-  return connection.connection_id;
+  return {
+    niche,
+    subreddits: normalizeSubreddits(subreddits),
+    queries: normalizeQueries(queries),
+  };
 }
-
-// ============================================================
-// TASK PARSING
-//
-// Supports text tasks and JSON task objects.
-// Subreddits and queries are taken from each task.
-// ============================================================
 
 function normalizeSubreddits(values) {
   if (!Array.isArray(values)) {
@@ -276,20 +736,7 @@ function normalizeSubreddits(values) {
   return [
     ...new Set(
       values
-        .map((value) => {
-          let name = String(value || "").trim();
-
-          name = name.replace(
-            /^https?:\/\/(www\.)?reddit\.com\/r\//i,
-            ""
-          );
-
-          name = name.replace(/^r\//i, "");
-          name = name.replace(/^\/+|\/+$/g, "");
-          name = name.split("/")[0].trim();
-
-          return name;
-        })
+        .map(normalizeSubreddit)
         .filter(Boolean)
     ),
   ];
@@ -303,356 +750,30 @@ function normalizeQueries(values) {
   return [
     ...new Set(
       values
-        .map((value) => String(value || "").trim())
+        .map((value) => asString(value).trim())
         .filter(Boolean)
     ),
   ];
 }
 
-function extractSectionBullets(text, heading) {
-  const lines = String(text || "").split(/\r?\n/);
-
-  const headingRegex = new RegExp(
-    `^\\s*${heading}\\s*:\\s*$`,
-    "i"
-  );
-
-  let startIndex = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    if (headingRegex.test(lines[i].trim())) {
-      startIndex = i + 1;
-      break;
-    }
-  }
-
-  if (startIndex === -1) {
-    return [];
-  }
-
-  const result = [];
-
-  for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i].trim();
-
-    if (
-      /^[A-Za-z][A-Za-z0-9 _()/.-]{0,60}:\s*$/.test(line)
-    ) {
-      break;
-    }
-
-    const match = line.match(/^[-*•]\s*(.+)$/);
-
-    if (match) {
-      result.push(match[1].trim());
-    }
-  }
-
-  return result;
-}
-
-function parseTask(task) {
-  const content = task.task;
-
-  if (
-    content &&
-    typeof content === "object" &&
-    !Array.isArray(content)
-  ) {
-    return {
-      niche: String(
-        task.niche ||
-        content.niche ||
-        content.customer_niche ||
-        ""
-      ).trim(),
-
-      subreddits: normalizeSubreddits(
-        content.subreddits ||
-        content.recommended_subreddits ||
-        []
-      ),
-
-      queries: normalizeQueries(
-        content.queries ||
-        content.search_queries ||
-        []
-      ),
-    };
-  }
-
-  const text = String(content || "");
-
-  const nicheMatch = text.match(
-    /^\s*Customer\s+Niche\s*:\s*(.+?)\s*$/im
-  );
-
-  return {
-    niche: String(
-      task.niche || nicheMatch?.[1] || ""
-    ).trim(),
-
-    subreddits: normalizeSubreddits(
-      extractSectionBullets(
-        text,
-        "Recommended Subreddits"
-      )
-    ),
-
-    queries: normalizeQueries(
-      extractSectionBullets(text, "Search Queries")
-    ),
-  };
-}
-
 // ============================================================
-// FIND AND CLAIM THE LATEST REDDIT TASK
+// EXTRACT POSTS FROM COMPOSIO RESPONSE
 // ============================================================
-
-async function getCandidateTasks(env) {
-  const params = new URLSearchParams({
-    select:
-      "id,application_id,user_id,worker_type,source," +
-      "task,pending_count,error,niche,created_at," +
-      "started_at,status",
-
-    worker_type: "eq.reddit_research",
-
-    source: "eq.reddit",
-
-    pending_count: "gt.0",
-
-    order: "created_at.desc",
-
-    limit: "50",
-  });
-
-  const response = await supabaseRequest(
-    env,
-    `/rest/v1/planner_runs?${params.toString()}`
-  );
-
-  if (!Array.isArray(response.data)) {
-    throw new Error("Unexpected planner_runs response");
-  }
-
-  return response.data;
-}
-
-function isStaleProcessingTask(task) {
-  if (
-    String(task.status || "").toLowerCase() !==
-    "processing"
-  ) {
-    return false;
-  }
-
-  if (!task.started_at) {
-    return true;
-  }
-
-  const timestamp = Date.parse(task.started_at);
-
-  if (!Number.isFinite(timestamp)) {
-    return true;
-  }
-
-  return (
-    timestamp <
-    Date.now() - 15 * 60 * 1000
-  );
-}
-
-function isEligibleTask(task) {
-  const status = String(
-    task.status || ""
-  ).toLowerCase();
-
-  return (
-    Number(task.pending_count) > 0 &&
-    (
-      status === "pending" ||
-      isStaleProcessingTask(task)
-    )
-  );
-}
-
-async function claimTask(env, task) {
-  const params = new URLSearchParams({
-    id: `eq.${task.id}`,
-
-    pending_count: `eq.${task.pending_count}`,
-
-    select: "*",
-  });
-
-  const status = String(
-    task.status || ""
-  ).toLowerCase();
-
-  if (status === "processing") {
-    const staleBefore = new Date(
-      Date.now() - 15 * 60 * 1000
-    ).toISOString();
-
-    params.set("status", `eq.${task.status}`);
-    params.set("started_at", `lt.${staleBefore}`);
-  } else if (task.status == null) {
-    params.set("status", "is.null");
-  } else {
-    params.set("status", `eq.${task.status}`);
-  }
-
-  const response = await supabaseRequest(
-    env,
-    `/rest/v1/planner_runs?${params.toString()}`,
-    {
-      method: "PATCH",
-
-      headers: {
-        Prefer: "return=representation",
-      },
-
-      body: {
-        status: "processing",
-        started_at: new Date().toISOString(),
-        error: null,
-      },
-    }
-  );
-
-  if (
-    !Array.isArray(response.data) ||
-    response.data.length === 0
-  ) {
-    return null;
-  }
-
-  return response.data[0];
-}
-
-async function claimLatestTask(env) {
-  const tasks = await getCandidateTasks(env);
-
-  for (const task of tasks) {
-    if (!isEligibleTask(task)) {
-      continue;
-    }
-
-    const claimed = await claimTask(env, task);
-
-    if (claimed) {
-      return claimed;
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// EXTRACT ACTUAL REDDIT POSTS FROM COMPOSIO RESPONSE
-// ============================================================
-
-function normalizePost(object) {
-  if (!object || typeof object !== "object") {
-    return null;
-  }
-
-  const title = object.title;
-  const permalink = object.permalink;
-
-  const createdUtc = Number(
-    object.created_utc ??
-    object.createdUtc ??
-    object.created
-  );
-
-  const rawId = String(
-    object.id ||
-    object.post_id ||
-    object.name ||
-    ""
-  ).trim();
-
-  if (
-    !title ||
-    !permalink ||
-    !rawId ||
-    !Number.isFinite(createdUtc) ||
-    createdUtc <= 0
-  ) {
-    return null;
-  }
-
-  const id = rawId.replace(/^t3_/, "");
-
-  let postUrl = String(permalink).trim();
-
-  if (postUrl.startsWith("/")) {
-    postUrl = `https://www.reddit.com${postUrl}`;
-  }
-
-  const permalinkMatch = postUrl.match(
-    /\/r\/([^/]+)\/comments\//i
-  );
-
-  const subreddit = String(
-    object.subreddit ||
-    permalinkMatch?.[1] ||
-    ""
-  ).replace(/^r\//i, "").trim();
-
-  if (!subreddit) {
-    return null;
-  }
-
-  return {
-    id,
-    subreddit,
-    title: String(title).trim(),
-
-    postText: String(
-      object.selftext ??
-      object.post_text ??
-      object.body ??
-      ""
-    ),
-
-    postUrl,
-
-    author: String(
-      object.author ||
-      object.author_username ||
-      ""
-    ),
-
-    createdUtc: Math.floor(createdUtc),
-
-    score: Number.isFinite(Number(object.score))
-      ? Math.trunc(Number(object.score))
-      : 0,
-
-    numComments: Number.isFinite(
-      Number(object.num_comments ?? object.numComments)
-    )
-      ? Math.trunc(
-          Number(object.num_comments ?? object.numComments)
-        )
-      : 0,
-  };
-}
 
 function extractPosts(response) {
-  const found = new Map();
+  const found = [];
   const visited = new Set();
 
   function walk(value, depth = 0) {
-    if (
-      !value ||
-      typeof value !== "object" ||
-      depth > 15 ||
-      visited.has(value)
-    ) {
+    if (depth > 12 || value === null || value === undefined) {
+      return;
+    }
+
+    if (typeof value !== "object") {
+      return;
+    }
+
+    if (visited.has(value)) {
       return;
     }
 
@@ -662,22 +783,53 @@ function extractPosts(response) {
       for (const item of value) {
         walk(item, depth + 1);
       }
-
       return;
     }
 
-    const post = normalizePost(value);
+    // Common Reddit post fields.
+    const hasTitle =
+      typeof value.title === "string" &&
+      value.title.trim().length > 0;
 
-    if (post) {
-      found.set(post.id, post);
+    const permalink =
+      value.permalink ||
+      value.url ||
+      value.post_url ||
+      value.link;
+
+    const hasId =
+      value.id ||
+      value.post_id ||
+      value.name;
+
+    const hasDate =
+      value.created_utc !== undefined ||
+      value.created !== undefined ||
+      value.createdAt !== undefined ||
+      value.created_at !== undefined ||
+      value.timestamp !== undefined;
+
+    if (hasTitle && permalink && hasId && hasDate) {
+      found.push(value);
     }
 
+    // Search common wrapper properties.
     for (const [key, child] of Object.entries(value)) {
-      if (key === "children" && Array.isArray(child)) {
-        for (const entry of child) {
-          walk(entry?.data || entry, depth + 1);
-        }
-      } else if (child && typeof child === "object") {
+      if (
+        [
+          "data",
+          "results",
+          "posts",
+          "items",
+          "children",
+          "submissions",
+          "response",
+          "output",
+          "result",
+          "content",
+          "body",
+        ].includes(key)
+      ) {
         walk(child, depth + 1);
       }
     }
@@ -685,580 +837,411 @@ function extractPosts(response) {
 
   walk(response);
 
-  return [...found.values()];
-}
+  // Deduplicate the raw objects by post ID.
+  const unique = new Map();
 
-// ============================================================
-// RELEVANCE SCORING
-//
-// Uses task-specific niche and query keywords.
-// No AI and no fixed niche-specific keywords.
-// ============================================================
+  for (const post of found) {
+    const id = asString(
+      post.id || post.post_id || post.name
+    ).replace(/^t3_/, "");
 
-const STOP_WORDS = new Set([
-  "the", "and", "for", "with", "from", "that",
-  "this", "what", "when", "where", "which",
-  "who", "how", "why", "are", "was", "were",
-  "have", "has", "had", "can", "could", "would",
-  "should", "into", "about", "your", "you", "our",
-  "their", "they", "them", "its", "than", "then",
-  "not", "but", "all", "any", "use", "using",
-  "without", "before", "after", "more", "most",
-  "ways", "way", "best", "need", "looking",
-]);
-
-function meaningfulWords(text) {
-  const tokens =
-    String(text || "")
-      .toLowerCase()
-      .match(/[a-z0-9+#.-]+/g) || [];
-
-  return [
-    ...new Set(
-      tokens.filter(
-        (token) =>
-          token.length > 2 &&
-          !STOP_WORDS.has(token)
-      )
-    ),
-  ];
-}
-
-function calculateRelevance(post, niche, query) {
-  const title = post.title.toLowerCase();
-  const body = post.postText.toLowerCase();
-  const combined = `${title} ${body}`;
-
-  let score = 0;
-
-  if (combined.includes(query.toLowerCase())) {
-    score += 35;
-  }
-
-  for (const word of meaningfulWords(niche)) {
-    if (title.includes(word)) {
-      score += 10;
-    } else if (body.includes(word)) {
-      score += 5;
+    if (id && !unique.has(id)) {
+      unique.set(id, post);
     }
   }
 
-  for (const word of meaningfulWords(query)) {
-    if (title.includes(word)) {
-      score += 8;
-    } else if (body.includes(word)) {
-      score += 4;
+  return [...unique.values()];
+}
+
+// ============================================================
+// NORMALIZE A REDDIT POST
+// ============================================================
+
+function normalizePost(
+  post,
+  fallbackSubreddit,
+  matchedQuery,
+  niche
+) {
+  const title = asString(post.title).trim();
+
+  if (!title) {
+    return null;
+  }
+
+  const rawId = asString(
+    post.id || post.post_id || post.name
+  ).trim();
+
+  const redditPostId = rawId.replace(/^t3_/, "");
+
+  if (!redditPostId) {
+    return null;
+  }
+
+  let postUrl = asString(
+    post.permalink ||
+      post.post_url ||
+      post.url ||
+      post.link
+  ).trim();
+
+  if (postUrl.startsWith("/")) {
+    postUrl = `https://www.reddit.com${postUrl}`;
+  }
+
+  if (!postUrl || !/^https?:\/\//i.test(postUrl)) {
+    return null;
+  }
+
+  const subreddit = normalizeSubreddit(
+    post.subreddit ||
+      post.subreddit_name ||
+      post.subredditName ||
+      fallbackSubreddit
+  );
+
+  if (!subreddit) {
+    return null;
+  }
+
+  const createdUtc = normalizeTimestamp(
+    post.created_utc ??
+      post.created ??
+      post.createdAt ??
+      post.created_at ??
+      post.timestamp
+  );
+
+  if (!createdUtc) {
+    return null;
+  }
+
+  const postText = asString(
+    post.selftext ||
+      post.post_text ||
+      post.text ||
+      post.body ||
+      post.description
+  );
+
+  const author = asString(
+    post.author ||
+      post.author_username ||
+      post.username
+  ).replace(/^u\//, "");
+
+  const score = safeInteger(
+    post.score ??
+      post.ups ??
+      post.upvotes ??
+      0
+  );
+
+  const numComments = safeInteger(
+    post.num_comments ??
+      post.comments_count ??
+      post.comment_count ??
+      0
+  );
+
+  const relevanceScore = calculateRelevance(
+    title,
+    postText,
+    matchedQuery,
+    niche
+  );
+
+  return {
+    reddit_post_id: redditPostId,
+    subreddit,
+    title,
+    post_text: postText,
+    post_url: postUrl,
+    author_username: author || null,
+    created_utc: createdUtc,
+    score,
+    num_comments: numComments,
+    customer_niche: niche || null,
+    matched_query: matchedQuery,
+    relevance_score: relevanceScore,
+  };
+}
+
+// ============================================================
+// DATE AND NUMBER HELPERS
+// ============================================================
+
+function normalizeTimestamp(value) {
+  if (value === null || value === undefined || value === "") {
+    return 0;
+  }
+
+  let number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    const parsed = Date.parse(String(value));
+
+    if (!Number.isFinite(parsed)) {
+      return 0;
+    }
+
+    number = Math.floor(parsed / 1000);
+  }
+
+  // Milliseconds -> seconds.
+  if (number > 100000000000) {
+    number = Math.floor(number / 1000);
+  }
+
+  return Math.floor(number);
+}
+
+function safeInteger(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return 0;
+  }
+
+  return Math.trunc(number);
+}
+
+function isWithinAgeLimit(createdUtc) {
+  if (!createdUtc || createdUtc <= 0) {
+    return false;
+  }
+
+  const ageSeconds = Math.floor(Date.now() / 1000) - createdUtc;
+
+  return (
+    ageSeconds >= 0 &&
+    ageSeconds <= MAX_POST_AGE_DAYS * 24 * 60 * 60
+  );
+}
+
+// ============================================================
+// BASIC RELEVANCE SCORING
+// ============================================================
+
+function calculateRelevance(
+  title,
+  postText,
+  matchedQuery,
+  niche
+) {
+  const titleText = normalizeText(title);
+  const bodyText = normalizeText(postText);
+  const combinedText = `${titleText} ${bodyText}`.trim();
+
+  if (!combinedText) {
+    return 0;
+  }
+
+  const queryWords = normalizeText(matchedQuery)
+    .split(" ")
+    .filter((word) => word.length >= 3);
+
+  const uniqueQueryWords = [...new Set(queryWords)];
+
+  let matchedQueryWords = 0;
+
+  for (const word of uniqueQueryWords) {
+    if (combinedText.includes(word)) {
+      matchedQueryWords += 1;
     }
   }
 
-  const problemSignals = [
+  const queryScore =
+    uniqueQueryWords.length > 0
+      ? Math.round(
+          (matchedQueryWords / uniqueQueryWords.length) * 45
+        )
+      : 0;
+
+  const nicheWords = normalizeText(niche)
+    .split(" ")
+    .filter((word) => word.length >= 3);
+
+  let nicheMatches = 0;
+
+  for (const word of new Set(nicheWords)) {
+    if (combinedText.includes(word)) {
+      nicheMatches += 1;
+    }
+  }
+
+  const nicheScore = Math.min(20, nicheMatches * 10);
+
+  const problemTerms = [
     "problem",
     "struggle",
     "challenge",
     "difficult",
-    "difficulty",
-    "frustrated",
-    "recommend",
-    "alternative",
+    "issue",
+    "help",
+    "need",
     "looking for",
-    "need help",
     "how do i",
     "how can i",
-    "any advice",
-    "any suggestions",
-    "not working",
-    "failed",
-    "issue",
-    "solution",
+    "recommend",
+    "recommendation",
+    "alternative",
+    "frustrated",
+    "pain",
+    "expensive",
+    "cost",
+    "slow",
+    "manual",
     "automate",
-    "improve",
+    "automation",
+    "client",
+    "customer",
+    "revenue",
+    "sales",
+    "marketing",
+    "growth",
+    "onboarding",
+    "pricing",
+    "agency",
+    "agencies",
   ];
 
-  for (const signal of problemSignals) {
-    if (combined.includes(signal)) {
-      score += 4;
+  let problemMatches = 0;
+
+  for (const term of problemTerms) {
+    if (combinedText.includes(term)) {
+      problemMatches += 1;
     }
   }
 
-  return Math.max(0, Math.min(100, score));
+  const problemScore = Math.min(25, problemMatches * 5);
+
+  const titleBonus =
+    uniqueQueryWords.some((word) => titleText.includes(word))
+      ? 10
+      : 0;
+
+  return Math.max(
+    0,
+    Math.min(100, queryScore + nicheScore + problemScore + titleBonus)
+  );
 }
 
 // ============================================================
-// RESULTS TABLE HELPERS
+// READ EXISTING RESULTS FOR A TASK
 // ============================================================
 
-async function getSavedResults(env, plannerId) {
-  const params = new URLSearchParams({
-    select: "id,reddit_post_id",
-
+async function getExistingResults(env, plannerId) {
+  const query = new URLSearchParams({
+    select: "reddit_post_id,relevance_score",
     planner_id: `eq.${plannerId}`,
-
     limit: "100",
   });
 
-  const response = await supabaseRequest(
+  const results = await supabaseRequest(
     env,
-    `/rest/v1/reddit_research_results?${params.toString()}`
-  );
-
-  if (!Array.isArray(response.data)) {
-    throw new Error(
-      "Unexpected reddit_research_results response"
-    );
-  }
-
-  return response.data;
-}
-
-async function reconcileTaskProgress(env, task) {
-  const saved = await getSavedResults(env, task.id);
-
-  const savedCount = Math.min(
-    TOTAL_POSTS_PER_TASK,
-    saved.length
-  );
-
-  const pendingCount = Math.max(
-    0,
-    TOTAL_POSTS_PER_TASK - savedCount
-  );
-
-  const status =
-    pendingCount === 0
-      ? "Completed"
-      : "pending";
-
-  const params = new URLSearchParams({
-    id: `eq.${task.id}`,
-    select: "*",
-  });
-
-  const response = await supabaseRequest(
-    env,
-    `/rest/v1/planner_runs?${params.toString()}`,
+    "reddit_research_results",
     {
-      method: "PATCH",
-
-      headers: {
-        Prefer: "return=representation",
-      },
-
-      body: {
-        pending_count: pendingCount,
-        status,
-        error: null,
-      },
+      query: query.toString(),
     }
   );
 
-  if (
-    !Array.isArray(response.data) ||
-    response.data.length === 0
-  ) {
-    throw new Error(
-      "Could not reconcile planner_runs progress"
-    );
-  }
-
-  return {
-    savedCount,
-    pendingCount,
-    status,
-  };
+  return Array.isArray(results) ? results : [];
 }
 
-async function savePost(
-  env,
-  task,
-  post,
-  query,
-  relevanceScore
-) {
-  const params = new URLSearchParams({
+// ============================================================
+// SAVE RESULTS
+// ============================================================
+
+async function saveResults(env, task, posts) {
+  if (!posts.length) {
+    return 0;
+  }
+
+  const rows = posts.map((post) => ({
+    user_id: task.user_id,
+    application_id: task.application_id,
+    planner_id: task.id,
+    reddit_post_id: post.reddit_post_id,
+    subreddit: post.subreddit,
+    title: post.title,
+    post_text: post.post_text || null,
+    post_url: post.post_url,
+    author_username: post.author_username,
+    created_utc: post.created_utc,
+    score: post.score,
+    num_comments: post.num_comments,
+    customer_niche: post.customer_niche,
+    matched_query: post.matched_query,
+    relevance_score: post.relevance_score,
+  }));
+
+  const query = new URLSearchParams({
     on_conflict: "planner_id,reddit_post_id",
-    select: "id,reddit_post_id,planner_id",
   });
 
-  const response = await supabaseRequest(
+  const saved = await supabaseRequest(
     env,
-    `/rest/v1/reddit_research_results?${params.toString()}`,
+    "reddit_research_results",
     {
       method: "POST",
-
-      headers: {
-        Prefer:
-          "resolution=ignore-duplicates,return=representation",
-      },
-
-      body: {
-        user_id: task.user_id,
-        application_id: task.application_id,
-        planner_id: task.id,
-
-        reddit_post_id: post.id,
-        subreddit: post.subreddit,
-        title: post.title,
-        post_text: post.postText,
-        post_url: post.postUrl,
-        author_username: post.author || null,
-
-        created_utc: post.createdUtc,
-        score: post.score,
-        num_comments: post.numComments,
-
-        customer_niche: task.niche || null,
-        matched_query: query,
-        relevance_score: relevanceScore,
-      },
+      query: query.toString(),
+      body: rows,
+      prefer: "resolution=ignore-duplicates,return=representation",
     }
   );
 
-  return (
-    Array.isArray(response.data) &&
-    response.data.length > 0
-  );
+  return Array.isArray(saved) ? saved.length : 0;
 }
 
 // ============================================================
-// PROCESS ONE TASK
+// UPDATE TASK PROGRESS
 // ============================================================
 
-async function processTask(env, task) {
-  // Repair interrupted progress before doing new work.
-  const initialProgress = await reconcileTaskProgress(
-    env,
-    task
-  );
+async function updateTaskProgress(env, task, savedCount) {
+  const total = Math.min(POSTS_PER_TASK, savedCount);
+  const pendingCount = Math.max(0, POSTS_PER_TASK - total);
 
-  if (initialProgress.pendingCount === 0) {
-    return {
-      success: true,
-      task_id: task.id,
-      saved_count: initialProgress.savedCount,
-      pending_count: 0,
-      status: "Completed",
-      message: "Task already has five saved posts.",
-    };
-  }
+  const status = pendingCount === 0 ? "Completed" : "pending";
 
-  const parsed = parseTask(task);
+  await supabaseRequest(env, "planner_runs", {
+    method: "PATCH",
+    query: new URLSearchParams({
+      id: `eq.${task.id}`,
+    }).toString(),
+    body: {
+      pending_count: pendingCount,
+      status,
+      error: null,
+      started_at: null,
+    },
+    prefer: "return=minimal",
+  });
+}
 
-  if (!parsed.subreddits.length) {
-    throw new Error(
-      "No subreddits found in the task"
-    );
-  }
+// ============================================================
+// HANDLE FAILED TASK
+// ============================================================
 
-  if (!parsed.queries.length) {
-    throw new Error(
-      "No search queries found in the task"
-    );
-  }
-
-  const pendingCount = initialProgress.pendingCount;
-
-  // 5 => index 0, 4 => index 1, ... 1 => index 4.
-  const index = TOTAL_POSTS_PER_TASK - pendingCount;
-
-  const query = parsed.queries[index];
-  const primarySubreddit = parsed.subreddits[index];
-
-  if (!query) {
-    throw new Error(
-      `Missing search query number ${index + 1}`
-    );
-  }
-
-  if (!primarySubreddit) {
-    throw new Error(
-      `Missing subreddit number ${index + 1}`
-    );
-  }
-
-  const connectionId = await getRedditConnection(
-    env,
-    task
-  );
-
-  // Start with the mapped subreddit, then rotate through
-  // the others while keeping the same query.
-  const orderedSubreddits = [
-    ...parsed.subreddits.slice(index),
-    ...parsed.subreddits.slice(0, index),
-  ];
-
-  const cutoff =
-    Math.floor(Date.now() / 1000) -
-    MAX_POST_AGE_DAYS * 24 * 60 * 60;
-
-  for (const subreddit of orderedSubreddits) {
-    console.log(
-      `Searching r/${subreddit} with query "${query}"`
-    );
-
-    // FIX: task.user_id is passed as entity_id by the
-    // executeComposioTool() function.
-    const searchResponse = await executeComposioTool(
-      env,
-      connectionId,
-      REDDIT_SEARCH_TOOL,
-      {
-        query,
-        subreddit,
-        sort: "new",
-        time_filter: "all",
-        limit: MAX_SEARCH_RESULTS,
-      },
-      task.user_id
-    );
-
-    const candidates = extractPosts(searchResponse)
-      .filter((post) => {
-        return (
-          post.subreddit.toLowerCase() ===
-            subreddit.toLowerCase() &&
-          post.createdUtc >= cutoff &&
-          post.createdUtc <=
-            Math.floor(Date.now() / 1000) + 300
-        );
-      })
-      .map((post) => ({
-        ...post,
-        relevanceScore: calculateRelevance(
-          post,
-          parsed.niche,
-          query
-        ),
-      }))
-      .filter(
-        (post) =>
-          post.relevanceScore >= MIN_RELEVANCE_SCORE
-      )
-      .sort(
-        (a, b) => b.createdUtc - a.createdUtc
-      );
-
-    for (const post of candidates) {
-      let inserted;
-
-      try {
-        inserted = await savePost(
-          env,
-          task,
-          post,
-          query,
-          post.relevanceScore
-        );
-      } catch (insertError) {
-        // A network failure may happen after the database
-        // has already accepted the insert.
-        const saved = await getSavedResults(
-          env,
-          task.id
-        );
-
-        const alreadySaved = saved.some(
-          (row) => row.reddit_post_id === post.id
-        );
-
-        if (alreadySaved) {
-          const repaired = await reconcileTaskProgress(
-            env,
-            task
-          );
-
-          return {
-            success: true,
-            task_id: task.id,
-            saved_count: repaired.savedCount,
-            pending_count: repaired.pendingCount,
-            status: repaired.status,
-            recovered_after_insert_error: true,
-          };
-        }
-
-        throw insertError;
-      }
-
-      if (!inserted) {
-        // Duplicate result: try another post.
-        continue;
-      }
-
-      const progress = await reconcileTaskProgress(
-        env,
-        task
-      );
-
-      return {
-        success: true,
-        task_id: task.id,
-        application_id: task.application_id,
-
-        saved_post: {
-          reddit_post_id: post.id,
-          subreddit: post.subreddit,
-          title: post.title,
-          post_url: post.postUrl,
-          created_utc: post.createdUtc,
-          matched_query: query,
-          relevance_score: post.relevanceScore,
-        },
-
-        saved_count: progress.savedCount,
-        pending_count: progress.pendingCount,
-        status: progress.status,
-      };
-    }
-  }
-
-  // No post was saved, so leave the counter unchanged.
-  const message =
-    `No suitable new post found for "${query}" in the ` +
-    `configured subreddits within ${MAX_POST_AGE_DAYS} days.`;
-
-  await supabaseRequest(
-    env,
-    `/rest/v1/planner_runs?id=eq.${encodeURIComponent(task.id)}`,
-    {
+async function markTaskFailed(env, task, message) {
+  try {
+    await supabaseRequest(env, "planner_runs", {
       method: "PATCH",
-
+      query: new URLSearchParams({
+        id: `eq.${task.id}`,
+      }).toString(),
       body: {
         status: "pending",
-        error: message,
+        error: message.slice(0, 4000),
+        started_at: null,
       },
-    }
-  );
-
-  return {
-    success: false,
-    task_id: task.id,
-    pending_count: pendingCount,
-    error: message,
-  };
-}
-
-// ============================================================
-// OPTIONAL CRON AUTHENTICATION
-//
-// If CRON_SECRET is configured, send the same value in
-// the x-cron-secret request header.
-// ============================================================
-
-function cronAuthorized(request, env) {
-  if (!env.CRON_SECRET) {
-    return true;
-  }
-
-  return (
-    request.headers.get("x-cron-secret") ===
-    env.CRON_SECRET
-  );
-}
-
-// ============================================================
-// MAIN WORKER
-// ============================================================
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (
-      request.method === "GET" &&
-      url.pathname === "/health"
-    ) {
-      return jsonResponse({
-        success: true,
-        worker: WORKER_NAME,
-        status: "healthy",
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    if (
-      request.method === "POST" &&
-      url.pathname === "/cron"
-    ) {
-      if (!cronAuthorized(request, env)) {
-        return jsonResponse(
-          {
-            success: false,
-            error: "Unauthorized cron request",
-          },
-          401
-        );
-      }
-
-      let task = null;
-
-      try {
-        task = await claimLatestTask(env);
-
-        if (!task) {
-          return jsonResponse({
-            success: true,
-            message: "No eligible Reddit task found.",
-          });
-        }
-
-        const result = await processTask(env, task);
-
-        return jsonResponse(
-          result,
-          result.success ? 200 : 200
-        );
-      } catch (error) {
-        const message = errorMessage(error);
-
-        console.error(
-          "Reddit Worker error:",
-          message
-        );
-
-        if (task) {
-          try {
-            await supabaseRequest(
-              env,
-              `/rest/v1/planner_runs?id=eq.${encodeURIComponent(task.id)}`,
-              {
-                method: "PATCH",
-
-                body: {
-                  status: "pending",
-                  error: message.slice(0, 3000),
-                },
-              }
-            );
-          } catch (resetError) {
-            console.error(
-              "Could not reset task:",
-              errorMessage(resetError)
-            );
-          }
-        }
-
-        return jsonResponse(
-          {
-            success: false,
-            task_id: task?.id || null,
-            error: message,
-          },
-          500
-        );
-      }
-    }
-
-    return jsonResponse(
-      {
-        success: false,
-        error: "Not found",
-        routes: [
-          "GET /health",
-          "POST /cron",
-        ],
-      },
-      404
+      prefer: "return=minimal",
+    });
+  } catch (updateError) {
+    console.error(
+      "Could not update failed task:",
+      errorMessage(updateError)
     );
-  },
-};
+  }
+}
