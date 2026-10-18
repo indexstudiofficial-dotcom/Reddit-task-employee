@@ -2,14 +2,13 @@
 // REDDIT TASK EMPLOYEE
 // Cloudflare Worker
 //
-// Routes:
-//   GET  /health
-//   POST /cron
+// GET  /health
+// POST /cron
 //
-// Required Cloudflare secrets:
-//   SUPABASE_URL
-//   SUPABASE_SERVICE_ROLE_KEY
-//   COMPOSIO_API_KEY
+// Required secrets:
+// SUPABASE_URL
+// SUPABASE_SERVICE_ROLE_KEY
+// COMPOSIO_API_KEY
 //
 // No AI is used.
 // ============================================================
@@ -27,11 +26,8 @@ const MAX_POST_AGE_DAYS = 90;
 const MAX_SEARCH_RESULTS = 100;
 const MIN_RELEVANCE_SCORE = 15;
 
-// A task left in processing for this long can be reclaimed.
-const STALE_PROCESSING_MINUTES = 15;
-
 // ============================================================
-// HTTP RESPONSE HELPERS
+// RESPONSE HELPERS
 // ============================================================
 
 function jsonResponse(data, status = 200) {
@@ -51,7 +47,7 @@ function errorMessage(error) {
 }
 
 // ============================================================
-// SUPABASE REST API HELPER
+// SUPABASE REST API
 // ============================================================
 
 async function supabaseRequest(env, path, options = {}) {
@@ -60,7 +56,7 @@ async function supabaseRequest(env, path, options = {}) {
 
   if (!baseUrl || !serviceKey) {
     throw new Error(
-      "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY secret"
+      "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY"
     );
   }
 
@@ -68,8 +64,8 @@ async function supabaseRequest(env, path, options = {}) {
     method: options.method || "GET",
 
     headers: {
-      "apikey": serviceKey,
-      "Authorization": `Bearer ${serviceKey}`,
+      apikey: serviceKey,
+      Authorization: `Bearer ${serviceKey}`,
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
@@ -82,48 +78,59 @@ async function supabaseRequest(env, path, options = {}) {
 
   const text = await response.text();
 
-  let result = null;
+  let data = null;
 
   if (text) {
     try {
-      result = JSON.parse(text);
+      data = JSON.parse(text);
     } catch {
-      result = text;
+      data = text;
     }
   }
 
   if (!response.ok) {
     throw new Error(
-      `Supabase ${options.method || "GET"} failed ` +
-      `(${response.status}): ` +
-      `${typeof result === "string"
-        ? result
-        : JSON.stringify(result)}`
+      `Supabase request failed (${response.status}): ` +
+      `${typeof data === "string" ? data : JSON.stringify(data)}`
     );
   }
 
   return {
-    data: result,
+    data,
     headers: response.headers,
   };
 }
 
 // ============================================================
 // COMPOSIO TOOL EXECUTION
+//
+// FIX: Composio requires BOTH:
+// connected_account_id
+// entity_id
+//
+// entity_id is the user identifier associated with the
+// connected account.
 // ============================================================
 
 async function executeComposioTool(
   env,
   connectionId,
   toolSlug,
-  argumentsObject
+  argumentsObject,
+  userId
 ) {
   if (!env.COMPOSIO_API_KEY) {
     throw new Error("Missing COMPOSIO_API_KEY secret");
   }
 
   if (!connectionId) {
-    throw new Error("Reddit connection ID is missing");
+    throw new Error("Composio connection ID is missing");
+  }
+
+  if (!userId) {
+    throw new Error(
+      "Composio entity_id is missing: task.user_id is empty"
+    );
   }
 
   const url =
@@ -140,7 +147,12 @@ async function executeComposioTool(
 
     body: JSON.stringify({
       connected_account_id: connectionId,
+
+      // Required by the error returned by Composio.
+      entity_id: String(userId),
+
       version: "latest",
+
       arguments: argumentsObject,
     }),
   });
@@ -153,7 +165,7 @@ async function executeComposioTool(
     result = text ? JSON.parse(text) : {};
   } catch {
     throw new Error(
-      `Composio returned invalid JSON: ${text.slice(0, 500)}`
+      `Composio returned invalid JSON: ${text.slice(0, 800)}`
     );
   }
 
@@ -161,21 +173,21 @@ async function executeComposioTool(
     throw new Error(
       `Composio tool ${toolSlug} failed ` +
       `(${response.status}): ` +
-      JSON.stringify(result).slice(0, 1200)
+      JSON.stringify(result).slice(0, 1800)
     );
   }
 
   if (result.successful === false) {
     throw new Error(
       `Composio tool ${toolSlug} failed: ` +
-      JSON.stringify(result.error || result).slice(0, 1200)
+      JSON.stringify(result.error || result).slice(0, 1800)
     );
   }
 
   if (result.error && !result.data) {
     throw new Error(
       `Composio tool ${toolSlug} failed: ` +
-      JSON.stringify(result.error).slice(0, 1200)
+      JSON.stringify(result.error).slice(0, 1800)
     );
   }
 
@@ -183,17 +195,16 @@ async function executeComposioTool(
 }
 
 // ============================================================
-// FIND THE REDDIT CONNECTION
+// REDDIT CONNECTION LOOKUP
 //
-// Important:
-// Your actual database uses status = "connected".
-// We also accept "active" for compatibility.
+// Your database status is "connected", not just "active".
+// Match the same user and application as the task.
 // ============================================================
 
 async function getRedditConnection(env, task) {
   if (!task.user_id || !task.application_id) {
     throw new Error(
-      "The task must contain user_id and application_id"
+      "Task is missing user_id or application_id"
     );
   }
 
@@ -207,6 +218,7 @@ async function getRedditConnection(env, task) {
     application_id: `eq.${task.application_id}`,
 
     order: "updated_at.desc",
+
     limit: "50",
   });
 
@@ -215,16 +227,14 @@ async function getRedditConnection(env, task) {
     `/rest/v1/user_integrations?${params.toString()}`
   );
 
-  const rows = response.data;
-
-  if (!Array.isArray(rows)) {
+  if (!Array.isArray(response.data)) {
     throw new Error(
-      "Unexpected response when reading user_integrations"
+      "Unexpected response from user_integrations"
     );
   }
 
-  const connection = rows.find((row) => {
-    const integration = String(
+  const connection = response.data.find((row) => {
+    const integrationId = String(
       row.integration_id || ""
     ).toLowerCase();
 
@@ -233,7 +243,7 @@ async function getRedditConnection(env, task) {
     ).toLowerCase();
 
     return (
-      integration === "reddit" &&
+      integrationId === "reddit" &&
       Boolean(row.connection_id) &&
       ["connected", "active"].includes(status)
     );
@@ -244,7 +254,7 @@ async function getRedditConnection(env, task) {
       "No connected Reddit integration found for " +
       `user_id=${task.user_id}, ` +
       `application_id=${task.application_id}. ` +
-      `Matching integration rows found: ${rows.length}.`
+      `Rows returned=${response.data.length}`
     );
   }
 
@@ -252,23 +262,52 @@ async function getRedditConnection(env, task) {
 }
 
 // ============================================================
-// PARSE TASK CONTENT
+// TASK PARSING
 //
-// Supported text format:
-//
-// Customer Niche: Marketing agencies
-//
-// Recommended Subreddits:
-// - r/marketing
-// - r/small-business
-//
-// Search Queries:
-// - finding new clients consistently
-// - client onboarding challenges
-//
-// The worker does not hardcode niche-specific subreddits
-// or search queries.
+// Supports text tasks and JSON task objects.
+// Subreddits and queries are taken from each task.
 // ============================================================
+
+function normalizeSubreddits(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      values
+        .map((value) => {
+          let name = String(value || "").trim();
+
+          name = name.replace(
+            /^https?:\/\/(www\.)?reddit\.com\/r\//i,
+            ""
+          );
+
+          name = name.replace(/^r\//i, "");
+          name = name.replace(/^\/+|\/+$/g, "");
+          name = name.split("/")[0].trim();
+
+          return name;
+        })
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function normalizeQueries(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      values
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    ),
+  ];
+}
 
 function extractSectionBullets(text, heading) {
   const lines = String(text || "").split(/\r?\n/);
@@ -296,17 +335,16 @@ function extractSectionBullets(text, heading) {
   for (let i = startIndex; i < lines.length; i++) {
     const line = lines[i].trim();
 
-    // Stop at the next heading, such as "Search Queries:"
     if (
       /^[A-Za-z][A-Za-z0-9 _()/.-]{0,60}:\s*$/.test(line)
     ) {
       break;
     }
 
-    const bulletMatch = line.match(/^[-*•]\s*(.+)$/);
+    const match = line.match(/^[-*•]\s*(.+)$/);
 
-    if (bulletMatch) {
-      result.push(bulletMatch[1].trim());
+    if (match) {
+      result.push(match[1].trim());
     }
   }
 
@@ -314,112 +352,61 @@ function extractSectionBullets(text, heading) {
 }
 
 function parseTask(task) {
-  const taskContent = task.task;
+  const content = task.task;
 
-  // Also support a JSON task payload.
   if (
-    taskContent &&
-    typeof taskContent === "object" &&
-    !Array.isArray(taskContent)
+    content &&
+    typeof content === "object" &&
+    !Array.isArray(content)
   ) {
-    const niche =
-      task.niche ||
-      taskContent.niche ||
-      taskContent.customer_niche ||
-      "";
-
-    const subreddits =
-      taskContent.subreddits ||
-      taskContent.recommended_subreddits ||
-      [];
-
-    const queries =
-      taskContent.queries ||
-      taskContent.search_queries ||
-      [];
-
     return {
-      niche: String(niche).trim(),
+      niche: String(
+        task.niche ||
+        content.niche ||
+        content.customer_niche ||
+        ""
+      ).trim(),
 
-      subreddits: normalizeSubreddits(subreddits),
+      subreddits: normalizeSubreddits(
+        content.subreddits ||
+        content.recommended_subreddits ||
+        []
+      ),
 
-      queries: normalizeQueries(queries),
+      queries: normalizeQueries(
+        content.queries ||
+        content.search_queries ||
+        []
+      ),
     };
   }
 
-  const text = String(taskContent || "");
+  const text = String(content || "");
 
   const nicheMatch = text.match(
     /^\s*Customer\s+Niche\s*:\s*(.+?)\s*$/im
   );
 
-  const niche = String(
-    task.niche || nicheMatch?.[1] || ""
-  ).trim();
-
-  const subreddits = extractSectionBullets(
-    text,
-    "Recommended Subreddits"
-  );
-
-  const queries = extractSectionBullets(
-    text,
-    "Search Queries"
-  );
-
   return {
-    niche,
+    niche: String(
+      task.niche || nicheMatch?.[1] || ""
+    ).trim(),
 
-    subreddits: normalizeSubreddits(subreddits),
+    subreddits: normalizeSubreddits(
+      extractSectionBullets(
+        text,
+        "Recommended Subreddits"
+      )
+    ),
 
-    queries: normalizeQueries(queries),
+    queries: normalizeQueries(
+      extractSectionBullets(text, "Search Queries")
+    ),
   };
 }
 
-function normalizeSubreddits(values) {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-
-  return [
-    ...new Set(
-      values
-        .map((value) => {
-          let name = String(value || "").trim();
-
-          name = name.replace(/^https?:\/\/(www\.)?reddit\.com\/r\//i, "");
-          name = name.replace(/^r\//i, "");
-          name = name.replace(/^\/+|\/+$/g, "");
-
-          // Keep just the subreddit name.
-          name = name.split("/")[0].trim();
-
-          return name;
-        })
-        .filter(Boolean)
-    ),
-  ];
-}
-
-function normalizeQueries(values) {
-  if (!Array.isArray(values)) {
-    return [];
-  }
-
-  return [
-    ...new Set(
-      values
-        .map((value) => String(value || "").trim())
-        .filter(Boolean)
-    ),
-  ];
-}
-
 // ============================================================
-// CLAIM THE LATEST ELIGIBLE TASK
-//
-// The task is claimed with an optimistic PATCH.
-// A stale processing task can be reclaimed after 15 minutes.
+// FIND AND CLAIM THE LATEST REDDIT TASK
 // ============================================================
 
 async function getCandidateTasks(env) {
@@ -453,9 +440,10 @@ async function getCandidateTasks(env) {
 }
 
 function isStaleProcessingTask(task) {
-  const status = String(task.status || "").toLowerCase();
-
-  if (status !== "processing") {
+  if (
+    String(task.status || "").toLowerCase() !==
+    "processing"
+  ) {
     return false;
   }
 
@@ -463,37 +451,33 @@ function isStaleProcessingTask(task) {
     return true;
   }
 
-  const startedAt = Date.parse(task.started_at);
+  const timestamp = Date.parse(task.started_at);
 
-  if (!Number.isFinite(startedAt)) {
+  if (!Number.isFinite(timestamp)) {
     return true;
   }
 
-  const staleBefore =
-    Date.now() -
-    STALE_PROCESSING_MINUTES * 60 * 1000;
-
-  return startedAt < staleBefore;
+  return (
+    timestamp <
+    Date.now() - 15 * 60 * 1000
+  );
 }
 
 function isEligibleTask(task) {
-  const status = String(task.status || "").toLowerCase();
-
-  if (Number(task.pending_count) <= 0) {
-    return false;
-  }
+  const status = String(
+    task.status || ""
+  ).toLowerCase();
 
   return (
-    status === "pending" ||
-    isStaleProcessingTask(task)
+    Number(task.pending_count) > 0 &&
+    (
+      status === "pending" ||
+      isStaleProcessingTask(task)
+    )
   );
 }
 
 async function claimTask(env, task) {
-  const previousStatus = String(
-    task.status || ""
-  ).toLowerCase();
-
   const params = new URLSearchParams({
     id: `eq.${task.id}`,
 
@@ -502,15 +486,16 @@ async function claimTask(env, task) {
     select: "*",
   });
 
-  if (previousStatus === "processing") {
-    // Only reclaim it if its processing lease is stale.
+  const status = String(
+    task.status || ""
+  ).toLowerCase();
+
+  if (status === "processing") {
     const staleBefore = new Date(
-      Date.now() -
-      STALE_PROCESSING_MINUTES * 60 * 1000
+      Date.now() - 15 * 60 * 1000
     ).toISOString();
 
     params.set("status", `eq.${task.status}`);
-
     params.set("started_at", `lt.${staleBefore}`);
   } else if (task.status == null) {
     params.set("status", "is.null");
@@ -525,7 +510,7 @@ async function claimTask(env, task) {
       method: "PATCH",
 
       headers: {
-        "Prefer": "return=representation",
+        Prefer: "return=representation",
       },
 
       body: {
@@ -536,24 +521,25 @@ async function claimTask(env, task) {
     }
   );
 
-  const rows = response.data;
-
-  if (!Array.isArray(rows) || rows.length === 0) {
+  if (
+    !Array.isArray(response.data) ||
+    response.data.length === 0
+  ) {
     return null;
   }
 
-  return rows[0];
+  return response.data[0];
 }
 
 async function claimLatestTask(env) {
-  const candidates = await getCandidateTasks(env);
+  const tasks = await getCandidateTasks(env);
 
-  for (const candidate of candidates) {
-    if (!isEligibleTask(candidate)) {
+  for (const task of tasks) {
+    if (!isEligibleTask(task)) {
       continue;
     }
 
-    const claimed = await claimTask(env, candidate);
+    const claimed = await claimTask(env, task);
 
     if (claimed) {
       return claimed;
@@ -564,19 +550,8 @@ async function claimLatestTask(env) {
 }
 
 // ============================================================
-// EXTRACT ACTUAL REDDIT POSTS FROM COMPOSIO RESPONSES
-//
-// Reddit search results may be nested inside data.children,
-// posts, results, or another response wrapper.
+// EXTRACT ACTUAL REDDIT POSTS FROM COMPOSIO RESPONSE
 // ============================================================
-
-function subredditFromPermalink(permalink) {
-  const match = String(permalink || "").match(
-    /\/r\/([^/]+)\/comments\//i
-  );
-
-  return match ? match[1] : "";
-}
 
 function normalizePost(object) {
   if (!object || typeof object !== "object") {
@@ -584,7 +559,6 @@ function normalizePost(object) {
   }
 
   const title = object.title;
-
   const permalink = object.permalink;
 
   const createdUtc = Number(
@@ -610,8 +584,7 @@ function normalizePost(object) {
     return null;
   }
 
-  // Convert fullname t3_abc123 to post ID abc123.
-  const postId = rawId.replace(/^t3_/, "");
+  const id = rawId.replace(/^t3_/, "");
 
   let postUrl = String(permalink).trim();
 
@@ -619,9 +592,13 @@ function normalizePost(object) {
     postUrl = `https://www.reddit.com${postUrl}`;
   }
 
+  const permalinkMatch = postUrl.match(
+    /\/r\/([^/]+)\/comments\//i
+  );
+
   const subreddit = String(
     object.subreddit ||
-    subredditFromPermalink(postUrl) ||
+    permalinkMatch?.[1] ||
     ""
   ).replace(/^r\//i, "").trim();
 
@@ -630,10 +607,8 @@ function normalizePost(object) {
   }
 
   return {
-    id: postId,
-
+    id,
     subreddit,
-
     title: String(title).trim(),
 
     postText: String(
@@ -673,14 +648,11 @@ function extractPosts(response) {
 
   function walk(value, depth = 0) {
     if (
-      value == null ||
+      !value ||
+      typeof value !== "object" ||
       depth > 15 ||
-      typeof value !== "object"
+      visited.has(value)
     ) {
-      return;
-    }
-
-    if (visited.has(value)) {
       return;
     }
 
@@ -700,24 +672,12 @@ function extractPosts(response) {
       found.set(post.id, post);
     }
 
-    // Handle Reddit API-style listings.
-    if (Array.isArray(value.children)) {
-      for (const child of value.children) {
-        if (child && child.data) {
-          walk(child.data, depth + 1);
-        } else {
-          walk(child, depth + 1);
-        }
-      }
-    }
-
-    // Handle other Composio response wrappers.
     for (const [key, child] of Object.entries(value)) {
-      if (key === "children") {
-        continue;
-      }
-
-      if (child && typeof child === "object") {
+      if (key === "children" && Array.isArray(child)) {
+        for (const entry of child) {
+          walk(entry?.data || entry, depth + 1);
+        }
+      } else if (child && typeof child === "object") {
         walk(child, depth + 1);
       }
     }
@@ -729,26 +689,10 @@ function extractPosts(response) {
 }
 
 // ============================================================
-// DATE FILTER
-// ============================================================
-
-function isWithinLast90Days(post) {
-  const nowSeconds = Math.floor(Date.now() / 1000);
-
-  const cutoffSeconds =
-    nowSeconds -
-    MAX_POST_AGE_DAYS * 24 * 60 * 60;
-
-  return (
-    post.createdUtc >= cutoffSeconds &&
-    post.createdUtc <= nowSeconds + 300
-  );
-}
-
-// ============================================================
-// RULE-BASED RELEVANCE SCORING
+// RELEVANCE SCORING
 //
-// No AI. The niche and query are taken from the task.
+// Uses task-specific niche and query keywords.
+// No AI and no fixed niche-specific keywords.
 // ============================================================
 
 const STOP_WORDS = new Set([
@@ -763,72 +707,57 @@ const STOP_WORDS = new Set([
   "ways", "way", "best", "need", "looking",
 ]);
 
-function words(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/https?:\/\/\S+/g, " ")
-    .match(/[a-z0-9+#.-]+/g) || [];
-}
-
 function meaningfulWords(text) {
+  const tokens =
+    String(text || "")
+      .toLowerCase()
+      .match(/[a-z0-9+#.-]+/g) || [];
+
   return [
     ...new Set(
-      words(text).filter(
-        (word) =>
-          word.length > 2 &&
-          !STOP_WORDS.has(word)
+      tokens.filter(
+        (token) =>
+          token.length > 2 &&
+          !STOP_WORDS.has(token)
       )
     ),
   ];
 }
 
 function calculateRelevance(post, niche, query) {
-  const title = String(post.title || "").toLowerCase();
-
-  const body = String(post.postText || "").toLowerCase();
-
+  const title = post.title.toLowerCase();
+  const body = post.postText.toLowerCase();
   const combined = `${title} ${body}`;
-
-  const nicheTokens = meaningfulWords(niche);
-
-  const queryTokens = meaningfulWords(query);
 
   let score = 0;
 
-  // Matching the requested query is the strongest signal.
-  if (query && combined.includes(query.toLowerCase())) {
+  if (combined.includes(query.toLowerCase())) {
     score += 35;
   }
 
-  // Match niche terms.
-  for (const token of nicheTokens) {
-    if (title.includes(token)) {
+  for (const word of meaningfulWords(niche)) {
+    if (title.includes(word)) {
       score += 10;
-    } else if (body.includes(token)) {
+    } else if (body.includes(word)) {
       score += 5;
     }
   }
 
-  // Match query terms.
-  for (const token of queryTokens) {
-    if (title.includes(token)) {
+  for (const word of meaningfulWords(query)) {
+    if (title.includes(word)) {
       score += 8;
-    } else if (body.includes(token)) {
+    } else if (body.includes(word)) {
       score += 4;
     }
   }
 
-  // Generic signals that a post discusses a real problem.
   const problemSignals = [
     "problem",
     "struggle",
-    "challenging",
     "challenge",
     "difficult",
     "difficulty",
-    "pain point",
     "frustrated",
-    "recommendation",
     "recommend",
     "alternative",
     "looking for",
@@ -855,10 +784,7 @@ function calculateRelevance(post, niche, query) {
 }
 
 // ============================================================
-// COUNT SAVED RESULTS FOR A TASK
-//
-// This helps recover from a case where the post insert worked
-// but the planner_runs counter update failed.
+// RESULTS TABLE HELPERS
 // ============================================================
 
 async function getSavedResults(env, plannerId) {
@@ -884,22 +810,12 @@ async function getSavedResults(env, plannerId) {
   return response.data;
 }
 
-// ============================================================
-// RECONCILE TASK PROGRESS
-//
-// The results table is used to calculate the true progress.
-// 5 results => pending_count = 0, status = Completed.
-// ============================================================
-
 async function reconcileTaskProgress(env, task) {
-  const savedResults = await getSavedResults(
-    env,
-    task.id
-  );
+  const saved = await getSavedResults(env, task.id);
 
   const savedCount = Math.min(
     TOTAL_POSTS_PER_TASK,
-    savedResults.length
+    saved.length
   );
 
   const pendingCount = Math.max(
@@ -907,7 +823,7 @@ async function reconcileTaskProgress(env, task) {
     TOTAL_POSTS_PER_TASK - savedCount
   );
 
-  const nextStatus =
+  const status =
     pendingCount === 0
       ? "Completed"
       : "pending";
@@ -924,12 +840,12 @@ async function reconcileTaskProgress(env, task) {
       method: "PATCH",
 
       headers: {
-        "Prefer": "return=representation",
+        Prefer: "return=representation",
       },
 
       body: {
         pending_count: pendingCount,
-        status: nextStatus,
+        status,
         error: null,
       },
     }
@@ -940,23 +856,16 @@ async function reconcileTaskProgress(env, task) {
     response.data.length === 0
   ) {
     throw new Error(
-      "Could not update planner task progress"
+      "Could not reconcile planner_runs progress"
     );
   }
 
   return {
     savedCount,
     pendingCount,
-    status: nextStatus,
+    status,
   };
 }
-
-// ============================================================
-// SAVE ONE POST
-//
-// The unique constraint (planner_id, reddit_post_id)
-// prevents the same post being saved twice for one task.
-// ============================================================
 
 async function savePost(
   env,
@@ -977,116 +886,58 @@ async function savePost(
       method: "POST",
 
       headers: {
-        "Prefer":
+        Prefer:
           "resolution=ignore-duplicates,return=representation",
       },
 
       body: {
         user_id: task.user_id,
-
         application_id: task.application_id,
-
         planner_id: task.id,
 
         reddit_post_id: post.id,
-
         subreddit: post.subreddit,
-
         title: post.title,
-
         post_text: post.postText,
-
         post_url: post.postUrl,
-
         author_username: post.author || null,
 
         created_utc: post.createdUtc,
-
         score: post.score,
-
         num_comments: post.numComments,
 
         customer_niche: task.niche || null,
-
         matched_query: query,
-
         relevance_score: relevanceScore,
       },
     }
   );
 
-  const insertedRows = response.data;
-
-  // With ignore-duplicates, a duplicate insert returns an
-  // empty representation rather than creating a second row.
   return (
-    Array.isArray(insertedRows) &&
-    insertedRows.length > 0
+    Array.isArray(response.data) &&
+    response.data.length > 0
   );
 }
 
 // ============================================================
-// RESET A TASK AFTER AN ERROR
-// ============================================================
-
-async function resetTaskAfterError(env, task, error) {
-  try {
-    const params = new URLSearchParams({
-      id: `eq.${task.id}`,
-      select: "id,status",
-    });
-
-    await supabaseRequest(
-      env,
-      `/rest/v1/planner_runs?${params.toString()}`,
-      {
-        method: "PATCH",
-
-        headers: {
-          "Prefer": "return=representation",
-        },
-
-        body: {
-          status: "pending",
-          error: String(error).slice(0, 3000),
-        },
-      }
-    );
-  } catch (resetError) {
-    console.error(
-      "Could not reset task:",
-      errorMessage(resetError)
-    );
-  }
-}
-
-// ============================================================
 // PROCESS ONE TASK
-//
-// Mapping:
-//   pending_count 5 => first subreddit + first query
-//   pending_count 4 => second subreddit + second query
-//   pending_count 3 => third subreddit + third query
-//   pending_count 2 => fourth subreddit + fourth query
-//   pending_count 1 => fifth subreddit + fifth query
-//
-// If no suitable post exists in the primary subreddit,
-// the worker rotates through the other subreddits using
-// the SAME query.
 // ============================================================
 
 async function processTask(env, task) {
-  // First reconcile progress. This also repairs an interrupted
-  // previous run if the result was saved but the counter was not.
-  const progress = await reconcileTaskProgress(env, task);
+  // Repair interrupted progress before doing new work.
+  const initialProgress = await reconcileTaskProgress(
+    env,
+    task
+  );
 
-  if (progress.pendingCount === 0) {
+  if (initialProgress.pendingCount === 0) {
     return {
       success: true,
       task_id: task.id,
+      saved_count: initialProgress.savedCount,
+      pending_count: 0,
       status: "Completed",
-      saved_count: progress.savedCount,
-      message: "This task already has five saved posts.",
+      message: "Task already has five saved posts.",
     };
   }
 
@@ -1094,34 +945,33 @@ async function processTask(env, task) {
 
   if (!parsed.subreddits.length) {
     throw new Error(
-      "No subreddits were found under Recommended Subreddits"
+      "No subreddits found in the task"
     );
   }
 
   if (!parsed.queries.length) {
     throw new Error(
-      "No queries were found under Search Queries"
+      "No search queries found in the task"
     );
   }
 
-  const remaining = Number(progress.pendingCount);
+  const pendingCount = initialProgress.pendingCount;
 
-  const index = TOTAL_POSTS_PER_TASK - remaining;
+  // 5 => index 0, 4 => index 1, ... 1 => index 4.
+  const index = TOTAL_POSTS_PER_TASK - pendingCount;
 
   const query = parsed.queries[index];
+  const primarySubreddit = parsed.subreddits[index];
 
   if (!query) {
     throw new Error(
-      `The task does not contain query number ${index + 1}`
+      `Missing search query number ${index + 1}`
     );
   }
 
-  const primarySubreddit =
-    parsed.subreddits[index];
-
   if (!primarySubreddit) {
     throw new Error(
-      `The task does not contain subreddit number ${index + 1}`
+      `Missing subreddit number ${index + 1}`
     );
   }
 
@@ -1130,22 +980,24 @@ async function processTask(env, task) {
     task
   );
 
-  // Rotate through subreddits, starting with the one mapped
-  // to the current pending_count.
+  // Start with the mapped subreddit, then rotate through
+  // the others while keeping the same query.
   const orderedSubreddits = [
     ...parsed.subreddits.slice(index),
     ...parsed.subreddits.slice(0, index),
   ];
 
-  const cutoffSeconds =
+  const cutoff =
     Math.floor(Date.now() / 1000) -
     MAX_POST_AGE_DAYS * 24 * 60 * 60;
 
   for (const subreddit of orderedSubreddits) {
     console.log(
-      `Searching r/${subreddit} for "${query}"`
+      `Searching r/${subreddit} with query "${query}"`
     );
 
+    // FIX: task.user_id is passed as entity_id by the
+    // executeComposioTool() function.
     const searchResponse = await executeComposioTool(
       env,
       connectionId,
@@ -1156,20 +1008,18 @@ async function processTask(env, task) {
         sort: "new",
         time_filter: "all",
         limit: MAX_SEARCH_RESULTS,
-      }
+      },
+      task.user_id
     );
 
-    const posts = extractPosts(searchResponse);
-
-    // Keep only posts from the requested subreddit and
-    // within the 90-day window.
-    const eligiblePosts = posts
+    const candidates = extractPosts(searchResponse)
       .filter((post) => {
         return (
           post.subreddit.toLowerCase() ===
             subreddit.toLowerCase() &&
-          post.createdUtc >= cutoffSeconds &&
-          isWithinLast90Days(post)
+          post.createdUtc >= cutoff &&
+          post.createdUtc <=
+            Math.floor(Date.now() / 1000) + 300
         );
       })
       .map((post) => ({
@@ -1188,7 +1038,7 @@ async function processTask(env, task) {
         (a, b) => b.createdUtc - a.createdUtc
       );
 
-    for (const post of eligiblePosts) {
+    for (const post of candidates) {
       let inserted;
 
       try {
@@ -1200,14 +1050,14 @@ async function processTask(env, task) {
           post.relevanceScore
         );
       } catch (insertError) {
-        // The request could fail after the database inserted
-        // the row. Check the database before reporting failure.
-        const existing = await getSavedResults(
+        // A network failure may happen after the database
+        // has already accepted the insert.
+        const saved = await getSavedResults(
           env,
           task.id
         );
 
-        const alreadySaved = existing.some(
+        const alreadySaved = saved.some(
           (row) => row.reddit_post_id === post.id
         );
 
@@ -1220,9 +1070,9 @@ async function processTask(env, task) {
           return {
             success: true,
             task_id: task.id,
-            status: repaired.status,
             saved_count: repaired.savedCount,
             pending_count: repaired.pendingCount,
+            status: repaired.status,
             recovered_after_insert_error: true,
           };
         }
@@ -1231,13 +1081,11 @@ async function processTask(env, task) {
       }
 
       if (!inserted) {
-        // Duplicate: try another real post.
+        // Duplicate result: try another post.
         continue;
       }
 
-      // One new post was inserted. Recalculate progress
-      // from saved rows instead of blindly decrementing.
-      const updatedProgress = await reconcileTaskProgress(
+      const progress = await reconcileTaskProgress(
         env,
         task
       );
@@ -1257,21 +1105,17 @@ async function processTask(env, task) {
           relevance_score: post.relevanceScore,
         },
 
-        saved_count: updatedProgress.savedCount,
-
-        pending_count: updatedProgress.pendingCount,
-
-        status: updatedProgress.status,
+        saved_count: progress.savedCount,
+        pending_count: progress.pendingCount,
+        status: progress.status,
       };
     }
   }
 
-  // No suitable new post was found in any configured subreddit.
-  // Do not decrement pending_count.
+  // No post was saved, so leave the counter unchanged.
   const message =
-    `No suitable new Reddit post found for query "${query}" ` +
-    `in the configured subreddits within the last ` +
-    `${MAX_POST_AGE_DAYS} days.`;
+    `No suitable new post found for "${query}" in the ` +
+    `configured subreddits within ${MAX_POST_AGE_DAYS} days.`;
 
   await supabaseRequest(
     env,
@@ -1289,22 +1133,16 @@ async function processTask(env, task) {
   return {
     success: false,
     task_id: task.id,
-    pending_count: updatedPendingCountFallback(task),
+    pending_count: pendingCount,
     error: message,
   };
-}
-
-function updatedPendingCountFallback(task) {
-  return Number(task.pending_count || 0);
 }
 
 // ============================================================
 // OPTIONAL CRON AUTHENTICATION
 //
-// If you set a CRON_SECRET Cloudflare secret, POST /cron must
-// include header: x-cron-secret: YOUR_SECRET
-//
-// If you don't set CRON_SECRET, this check is disabled.
+// If CRON_SECRET is configured, send the same value in
+// the x-cron-secret request header.
 // ============================================================
 
 function cronAuthorized(request, env) {
@@ -1326,7 +1164,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Health check
     if (
       request.method === "GET" &&
       url.pathname === "/health"
@@ -1339,7 +1176,6 @@ export default {
       });
     }
 
-    // Cron entry point
     if (
       request.method === "POST" &&
       url.pathname === "/cron"
@@ -1368,11 +1204,10 @@ export default {
 
         const result = await processTask(env, task);
 
-        if (!result.success) {
-          return jsonResponse(result, 200);
-        }
-
-        return jsonResponse(result, 200);
+        return jsonResponse(
+          result,
+          result.success ? 200 : 200
+        );
       } catch (error) {
         const message = errorMessage(error);
 
@@ -1382,11 +1217,25 @@ export default {
         );
 
         if (task) {
-          await resetTaskAfterError(
-            env,
-            task,
-            message
-          );
+          try {
+            await supabaseRequest(
+              env,
+              `/rest/v1/planner_runs?id=eq.${encodeURIComponent(task.id)}`,
+              {
+                method: "PATCH",
+
+                body: {
+                  status: "pending",
+                  error: message.slice(0, 3000),
+                },
+              }
+            );
+          } catch (resetError) {
+            console.error(
+              "Could not reset task:",
+              errorMessage(resetError)
+            );
+          }
         }
 
         return jsonResponse(
