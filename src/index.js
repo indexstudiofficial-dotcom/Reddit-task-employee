@@ -10,13 +10,35 @@ const COMPOSIO_API_BASE = "https://backend.composio.dev/api/v3.1";
 const REDDIT_SEARCH_TOOL = "REDDIT_SEARCH_ACROSS_SUBREDDITS";
 
 // Task requirements
-const POSTS_PER_TASK = 5;
+const POSTS_PER_TASK = 5; // total posts a task needs
+const POSTS_PER_RUN = 1; // posts saved per cron run
 const MAX_SEARCH_RESULTS = 100;
 const MAX_POST_AGE_DAYS = 90;
-const MIN_RELEVANCE_SCORE = 15;
+
+// Relevance (0-100). Posts below this are rejected.
+const MIN_RELEVANCE_SCORE = 45;
+// Stop searching early once a post this good is found.
+const GOOD_ENOUGH_SCORE = 65;
+// A post must contain at least this many distinct query keywords.
+const MIN_QUERY_KEYWORD_MATCHES = 2;
+// Cap on Composio calls per cron run (query x subreddit combinations).
+const MAX_SEARCH_CALLS_PER_RUN = 8;
 
 // Claim stale processing tasks again after 15 minutes.
 const STALE_TASK_MINUTES = 15;
+
+const STOPWORDS = new Set([
+  "the", "and", "for", "are", "but", "not", "you", "all", "any", "can",
+  "had", "her", "was", "one", "our", "out", "has", "have", "how", "who",
+  "its", "may", "than", "that", "this", "with", "from", "they", "will",
+  "what", "when", "where", "which", "while", "your", "about", "into",
+  "more", "most", "some", "such", "then", "them", "these", "those",
+  "there", "their", "been", "being", "does", "doing", "did", "get",
+  "just", "like", "make", "much", "many", "very", "way", "ways", "best",
+  "should", "would", "could", "also", "too", "own", "without", "before",
+  "after", "over", "under", "again", "using", "use", "find", "finding",
+  "dollars", "dollar",
+]);
 
 // ============================================================
 // MAIN REQUEST HANDLER
@@ -166,6 +188,42 @@ function normalizeText(value) {
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// Very light stemmer so "customers" matches "customer",
+// "validating" matches "validate", etc.
+function stem(word) {
+  let w = word;
+
+  if (w.length > 5 && w.endsWith("ing")) w = w.slice(0, -3);
+  else if (w.length > 4 && w.endsWith("ed")) w = w.slice(0, -2);
+  else if (w.length > 4 && w.endsWith("es")) w = w.slice(0, -2);
+  else if (w.length > 3 && w.endsWith("s")) w = w.slice(0, -1);
+
+  if (w.length > 4 && w.endsWith("e")) w = w.slice(0, -1);
+
+  return w;
+}
+
+// Returns an ordered list of meaningful stems from a text.
+function keywordStems(value) {
+  return normalizeText(value)
+    .split(" ")
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w))
+    .map(stem);
+}
+
+// Returns the full stemmed token string (used for phrase checks).
+function stemmedText(value) {
+  return (
+    " " +
+    normalizeText(value)
+      .split(" ")
+      .filter(Boolean)
+      .map(stem)
+      .join(" ") +
+    " "
+  );
 }
 
 // ============================================================
@@ -352,7 +410,7 @@ async function processTask(env, task) {
       );
     }
 
-    // Use the number of posts already saved for this task.
+    // Posts already saved for this task.
     const existingPosts = await getExistingResults(env, task.id);
 
     const existingIds = new Set(
@@ -376,96 +434,121 @@ async function processTask(env, task) {
       };
     }
 
-    const queryIndex = Math.min(
-      POSTS_PER_TASK - remaining,
-      taskDetails.queries.length - 1
-    );
+    // How many posts to save in THIS run (one at a time).
+    const wantThisRun = Math.min(POSTS_PER_RUN, remaining);
 
-    const searchQuery =
-      taskDetails.queries[queryIndex] || taskDetails.queries[0];
+    // Rotate which query/subreddit we start with so every run tries
+    // something different from the previous run.
+    const offset = existingPosts.length;
 
-    const primarySubredditIndex = Math.min(
-      POSTS_PER_TASK - remaining,
-      taskDetails.subreddits.length - 1
-    );
+    const queries = rotate(taskDetails.queries, offset);
+    const subreddits = rotate(taskDetails.subreddits, offset);
 
-    const primarySubreddit =
-      taskDetails.subreddits[primarySubredditIndex] ||
-      taskDetails.subreddits[0];
+    // Build the search plan: each query across each subreddit.
+    const plan = [];
 
-    // Search the primary subreddit first, then other subreddits
-    // if we do not find a suitable new post.
-    const subredditOrder = [
-      primarySubreddit,
-      ...taskDetails.subreddits.filter(
-        (name) => name.toLowerCase() !== primarySubreddit.toLowerCase()
-      ),
-    ];
+    for (const query of queries) {
+      for (const subreddit of subreddits) {
+        plan.push({ query, subreddit });
+      }
+    }
 
-    const foundPosts = [];
-    const seenThisRun = new Set(existingIds);
+    // Candidates keyed by post id (keep the highest-scoring copy).
+    const candidates = new Map();
+    let callsMade = 0;
+    let callsSucceeded = 0;
+    let lastError = null;
 
-    for (const subreddit of subredditOrder) {
-      if (foundPosts.length >= remaining) {
+    for (const step of plan) {
+      if (callsMade >= MAX_SEARCH_CALLS_PER_RUN) {
         break;
       }
 
-      const rawResponse = await executeComposioTool(
-        env,
-        connection.connection_id,
-        {
-          // IMPORTANT: Composio requires search_query, NOT query.
-          search_query: searchQuery,
-          subreddit,
-          sort: "new",
-          time_filter: "all",
-          limit: MAX_SEARCH_RESULTS,
-        },
-        task.user_id
-      );
+      callsMade += 1;
 
-      const normalizedPosts = extractPosts(rawResponse);
+      let rawResponse;
 
-      const eligiblePosts = normalizedPosts
+      try {
+        rawResponse = await executeComposioTool(
+          env,
+          connection.connection_id,
+          {
+            // IMPORTANT: Composio requires search_query, NOT query.
+            search_query: step.query,
+            subreddit: step.subreddit,
+            // Sort by relevance so Reddit returns posts that actually
+            // match the query instead of just the newest random posts.
+            sort: "relevance",
+            time_filter: "year",
+            limit: MAX_SEARCH_RESULTS,
+          },
+          task.user_id
+        );
+
+        callsSucceeded += 1;
+      } catch (error) {
+        lastError = error;
+        console.error(
+          `Search failed (${step.subreddit} / ${step.query}):`,
+          errorMessage(error)
+        );
+        await sleep(200);
+        continue;
+      }
+
+      const posts = extractPosts(rawResponse)
         .map((post) =>
-          normalizePost(post, subreddit, searchQuery, taskDetails.niche)
+          normalizePost(
+            post,
+            step.subreddit,
+            step.query,
+            taskDetails.niche
+          )
         )
         .filter(Boolean)
         .filter((post) => isWithinAgeLimit(post.created_utc))
-        .filter((post) => !seenThisRun.has(post.reddit_post_id))
-        .filter(
-          (post) => post.relevance_score >= MIN_RELEVANCE_SCORE
-        );
+        .filter((post) => !existingIds.has(post.reddit_post_id))
+        .filter((post) => post.relevance_score >= MIN_RELEVANCE_SCORE);
 
-      eligiblePosts.sort(
-        (a, b) => b.created_utc - a.created_utc
-      );
+      for (const post of posts) {
+        const previous = candidates.get(post.reddit_post_id);
 
-      for (const post of eligiblePosts) {
-        if (foundPosts.length >= remaining) {
-          break;
+        if (
+          !previous ||
+          post.relevance_score > previous.relevance_score
+        ) {
+          candidates.set(post.reddit_post_id, post);
         }
-
-        if (seenThisRun.has(post.reddit_post_id)) {
-          continue;
-        }
-
-        seenThisRun.add(post.reddit_post_id);
-        foundPosts.push(post);
       }
 
-      // Avoid hammering Composio when trying multiple subreddits.
+      // Stop early once we have a clearly good post.
+      const best = bestCandidate(candidates);
+
+      if (best && best.relevance_score >= GOOD_ENOUGH_SCORE) {
+        break;
+      }
+
       await sleep(200);
     }
 
+    // If every search failed, surface the error so the task is retried.
+    if (callsSucceeded === 0 && lastError) {
+      throw lastError;
+    }
+
+    // Pick only the best post(s) for this run.
+    const ranked = [...candidates.values()].sort(
+      (a, b) =>
+        b.relevance_score - a.relevance_score ||
+        b.created_utc - a.created_utc
+    );
+
+    const toSave = ranked.slice(0, wantThisRun);
+
     let savedCount = 0;
 
-    if (foundPosts.length > 0) {
-      savedCount = await saveResults(
-        env,
-        task,
-        foundPosts
-      );
+    if (toSave.length > 0) {
+      savedCount = await saveResults(env, task, toSave);
     }
 
     // Re-read results after insertion to calculate the true total.
@@ -475,13 +558,23 @@ async function processTask(env, task) {
 
     const completed = allResults.length >= POSTS_PER_TASK;
 
+    const saved = toSave[0] || null;
+
     return {
       task_id: task.id,
       niche: taskDetails.niche || task.niche || null,
-      matched_query: searchQuery,
-      searched_subreddit: primarySubreddit,
-      found_count: foundPosts.length,
+      searches_run: callsMade,
+      candidates_found: candidates.size,
       saved_count_this_run: savedCount,
+      saved_post: saved
+        ? {
+            title: saved.title,
+            subreddit: saved.subreddit,
+            url: saved.post_url,
+            matched_query: saved.matched_query,
+            relevance_score: saved.relevance_score,
+          }
+        : null,
       total_saved_count: allResults.length,
       pending_count: Math.max(
         0,
@@ -490,9 +583,9 @@ async function processTask(env, task) {
       status: completed ? "Completed" : "pending",
       message: completed
         ? "Task completed with five saved Reddit posts."
-        : foundPosts.length === 0
+        : toSave.length === 0
           ? "No new qualifying Reddit posts found. Task remains pending."
-          : "Results saved. More posts are still needed.",
+          : "1 post saved. More posts are still needed.",
     };
   } catch (error) {
     console.error(
@@ -501,7 +594,6 @@ async function processTask(env, task) {
     );
 
     // Return the task to pending so a future cron run can retry.
-    // The error is retained for debugging.
     await markTaskFailed(env, task, errorMessage(error));
 
     return {
@@ -511,6 +603,28 @@ async function processTask(env, task) {
       status: "pending",
     };
   }
+}
+
+function rotate(list, offset) {
+  if (list.length === 0) {
+    return list;
+  }
+
+  const start = offset % list.length;
+
+  return [...list.slice(start), ...list.slice(0, start)];
+}
+
+function bestCandidate(candidates) {
+  let best = null;
+
+  for (const post of candidates.values()) {
+    if (!best || post.relevance_score > best.relevance_score) {
+      best = post;
+    }
+  }
+
+  return best;
 }
 
 // ============================================================
@@ -869,6 +983,19 @@ function normalizePost(
     return null;
   }
 
+  // Skip adult, removed, deleted and pinned/mod posts.
+  if (post.over_18 === true || post.nsfw === true) {
+    return null;
+  }
+
+  if (post.stickied === true || post.pinned === true) {
+    return null;
+  }
+
+  if (post.removed_by_category) {
+    return null;
+  }
+
   const rawId = asString(
     post.id || post.post_id || post.name
   ).trim();
@@ -925,11 +1052,19 @@ function normalizePost(
       post.description
   );
 
+  if (/^\s*\[(removed|deleted)\]\s*$/i.test(postText)) {
+    return null;
+  }
+
   const author = asString(
     post.author ||
       post.author_username ||
       post.username
   ).replace(/^u\//, "");
+
+  if (author === "[deleted]" || author === "AutoModerator") {
+    return null;
+  }
 
   const score = safeInteger(
     post.score ??
@@ -944,6 +1079,11 @@ function normalizePost(
       post.comment_count ??
       0
   );
+
+  // Too little content to be a real discussion.
+  if (title.length + postText.length < 60) {
+    return null;
+  }
 
   const relevanceScore = calculateRelevance(
     title,
@@ -1021,7 +1161,16 @@ function isWithinAgeLimit(createdUtc) {
 }
 
 // ============================================================
-// BASIC RELEVANCE SCORING
+// RELEVANCE SCORING
+//
+// The post must really talk about the topic of the search query.
+// Generic "business words" alone can no longer qualify a post.
+//
+//   up to 60  query keyword coverage (title weighted higher)
+//   up to 10  exact phrase (two consecutive keywords) matches
+//   up to 10  niche words (e.g. "SaaS", "founders")
+//   up to 10  asking-for-help / problem intent
+//   -25       self-promotion posts ("I built", "check out my"...)
 // ============================================================
 
 function calculateRelevance(
@@ -1030,101 +1179,116 @@ function calculateRelevance(
   matchedQuery,
   niche
 ) {
-  const titleText = normalizeText(title);
-  const bodyText = normalizeText(postText);
-  const combinedText = `${titleText} ${bodyText}`.trim();
+  const titleStems = new Set(keywordStems(title));
+  const bodyStems = new Set(keywordStems(postText));
 
-  if (!combinedText) {
+  if (titleStems.size === 0 && bodyStems.size === 0) {
     return 0;
   }
 
-  const queryWords = normalizeText(matchedQuery)
-    .split(" ")
-    .filter((word) => word.length >= 3);
+  const queryKeywords = [...new Set(keywordStems(matchedQuery))];
 
-  const uniqueQueryWords = [...new Set(queryWords)];
+  if (queryKeywords.length === 0) {
+    return 0;
+  }
 
-  let matchedQueryWords = 0;
+  let titleMatches = 0;
+  let combinedMatches = 0;
 
-  for (const word of uniqueQueryWords) {
-    if (combinedText.includes(word)) {
-      matchedQueryWords += 1;
+  for (const word of queryKeywords) {
+    const inTitle = titleStems.has(word);
+    const inBody = bodyStems.has(word);
+
+    if (inTitle) titleMatches += 1;
+    if (inTitle || inBody) combinedMatches += 1;
+  }
+
+  // Hard gate: the post must clearly be about the query topic.
+  const requiredMatches = Math.min(
+    MIN_QUERY_KEYWORD_MATCHES,
+    queryKeywords.length
+  );
+
+  if (combinedMatches < requiredMatches) {
+    return 0;
+  }
+
+  const combinedCoverage = combinedMatches / queryKeywords.length;
+  const titleCoverage = titleMatches / queryKeywords.length;
+
+  const queryScore = Math.round(
+    combinedCoverage * 40 + titleCoverage * 20
+  );
+
+  // Phrase bonus: consecutive query keywords appearing together.
+  const fullText = stemmedText(`${title} ${postText}`);
+  let phraseHits = 0;
+
+  for (let i = 0; i < queryKeywords.length - 1; i++) {
+    const pair = ` ${queryKeywords[i]} ${queryKeywords[i + 1]} `;
+
+    if (fullText.includes(pair)) {
+      phraseHits += 1;
     }
   }
 
-  const queryScore =
-    uniqueQueryWords.length > 0
-      ? Math.round(
-          (matchedQueryWords / uniqueQueryWords.length) * 45
-        )
-      : 0;
+  const phraseScore = Math.min(10, phraseHits * 5);
 
-  const nicheWords = normalizeText(niche)
-    .split(" ")
-    .filter((word) => word.length >= 3);
-
+  // Niche bonus.
+  const nicheKeywords = [...new Set(keywordStems(niche))];
   let nicheMatches = 0;
 
-  for (const word of new Set(nicheWords)) {
-    if (combinedText.includes(word)) {
+  for (const word of nicheKeywords) {
+    if (titleStems.has(word) || bodyStems.has(word)) {
       nicheMatches += 1;
     }
   }
 
-  const nicheScore = Math.min(20, nicheMatches * 10);
+  const nicheScore = Math.min(10, nicheMatches * 5);
 
-  const problemTerms = [
-    "problem",
-    "struggle",
-    "challenge",
-    "difficult",
-    "issue",
-    "help",
-    "need",
-    "looking for",
-    "how do i",
-    "how can i",
-    "recommend",
-    "recommendation",
-    "alternative",
-    "frustrated",
-    "pain",
-    "expensive",
-    "cost",
-    "slow",
-    "manual",
-    "automate",
-    "automation",
-    "client",
-    "customer",
-    "revenue",
-    "sales",
-    "marketing",
-    "growth",
-    "onboarding",
-    "pricing",
-    "agency",
-    "agencies",
+  // Intent: is the author asking for help or describing a problem?
+  const rawText = `${title} ${postText}`.toLowerCase();
+
+  const intentPatterns = [
+    /\?/,
+    /\bhow (do|did|can|should|to)\b/,
+    /\blooking for\b/,
+    /\b(struggl|stuck|frustrat|challeng|problem|issue)/,
+    /\b(advice|tips|suggestions?|recommend)/,
+    /\b(any ideas|anyone (know|else|have)|what (do|would|should))\b/,
+    /\b(need|help)\b/,
   ];
 
-  let problemMatches = 0;
+  let intentHits = 0;
 
-  for (const term of problemTerms) {
-    if (combinedText.includes(term)) {
-      problemMatches += 1;
+  for (const pattern of intentPatterns) {
+    if (pattern.test(rawText)) {
+      intentHits += 1;
     }
   }
 
-  const problemScore = Math.min(25, problemMatches * 5);
+  const intentScore = Math.min(10, intentHits * 4);
 
-  const titleBonus =
-    uniqueQueryWords.some((word) => titleText.includes(word))
-      ? 10
-      : 0;
+  // Self-promotion penalty.
+  const promoText = `${title} ${postText.slice(0, 300)}`.toLowerCase();
+
+  const isPromo =
+    /\b(i (just )?(built|launched|made|created|released)|we (just )?(built|launched|released)|check out (my|our)|now live|launching (today|soon)|giveaway|promo code|discount code)\b/.test(
+      promoText
+    );
+
+  const promoPenalty = isPromo ? 25 : 0;
 
   return Math.max(
     0,
-    Math.min(100, queryScore + nicheScore + problemScore + titleBonus)
+    Math.min(
+      100,
+      queryScore +
+        phraseScore +
+        nicheScore +
+        intentScore -
+        promoPenalty
+    )
   );
 }
 
