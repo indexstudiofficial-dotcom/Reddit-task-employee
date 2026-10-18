@@ -22,7 +22,7 @@ const GOOD_ENOUGH_SCORE = 65;
 // A post must contain at least this many distinct query keywords.
 const MIN_QUERY_KEYWORD_MATCHES = 2;
 // Cap on Composio calls per cron run (query x subreddit combinations).
-const MAX_SEARCH_CALLS_PER_RUN = 8;
+const MAX_SEARCH_CALLS_PER_RUN = 10;
 
 // Claim stale processing tasks again after 15 minutes.
 const STALE_TASK_MINUTES = 15;
@@ -449,27 +449,66 @@ async function processTask(env, task) {
     const queries = rotate(taskDetails.queries, offset);
     const subreddits = rotate(taskDetails.subreddits, offset);
 
-    // Build the search plan: each query across each subreddit.
+    // Build the search plan. Combinations are interleaved so the first
+    // searches use DIFFERENT queries and DIFFERENT subreddits instead of
+    // exhausting one query first.
     const plan = [];
+    const seenPairs = new Set();
+    const totalPairs = queries.length * subreddits.length;
 
+    for (let k = 0; plan.length < totalPairs && k < totalPairs * 3; k++) {
+      const round = Math.floor(k / queries.length);
+      const query = queries[k % queries.length];
+      const subreddit = subreddits[(k + round) % subreddits.length];
+      const key = `${query}|${subreddit}`;
+
+      if (seenPairs.has(key)) {
+        continue;
+      }
+
+      seenPairs.add(key);
+      plan.push({ query, subreddit });
+    }
+
+    // Safety net: make sure every combination is present.
     for (const query of queries) {
       for (const subreddit of subreddits) {
-        plan.push({ query, subreddit });
+        const key = `${query}|${subreddit}`;
+
+        if (!seenPairs.has(key)) {
+          seenPairs.add(key);
+          plan.push({ query, subreddit });
+        }
       }
     }
 
     // Candidates keyed by post id (keep the highest-scoring copy).
     const candidates = new Map();
+    const searchLog = [];
+    let bestRejectedScore = 0;
     let callsMade = 0;
     let callsSucceeded = 0;
     let lastError = null;
 
-    for (const step of plan) {
-      if (callsMade >= MAX_SEARCH_CALLS_PER_RUN) {
-        break;
-      }
-
+    // Runs ONE Composio search and records exactly why posts were
+    // accepted or rejected. Posts are always scored against the ORIGINAL
+    // task query (step.query), even when a shortened query was searched.
+    async function runSearch(step, searchText) {
       callsMade += 1;
+
+      const log = {
+        subreddit: step.subreddit,
+        searched_query: searchText,
+        returned: 0,
+        unusable: 0,
+        wrong_subreddit: 0,
+        too_old: 0,
+        already_saved: 0,
+        low_relevance: 0,
+        accepted: 0,
+      };
+
+      searchLog.push(log);
 
       let rawResponse;
 
@@ -479,10 +518,8 @@ async function processTask(env, task) {
           connection.connection_id,
           {
             // IMPORTANT: Composio requires search_query, NOT query.
-            search_query: step.query,
+            search_query: searchText,
             subreddit: step.subreddit,
-            // Sort by relevance so Reddit returns posts that actually
-            // match the query instead of just the newest random posts.
             sort: "relevance",
             time_filter: "year",
             limit: MAX_SEARCH_RESULTS,
@@ -493,33 +530,57 @@ async function processTask(env, task) {
         callsSucceeded += 1;
       } catch (error) {
         lastError = error;
+        log.error = errorMessage(error).slice(0, 200);
         console.error(
-          `Search failed (${step.subreddit} / ${step.query}):`,
+          `Search failed (${step.subreddit} / ${searchText}):`,
           errorMessage(error)
         );
-        await sleep(200);
-        continue;
+        return log;
       }
 
-      const posts = extractPosts(rawResponse)
-        .map((post) =>
-          normalizePost(
-            post,
-            step.subreddit,
-            step.query,
-            taskDetails.niche
-          )
-        )
-        .filter(Boolean)
-        // HARD RULE: post must belong to one of the recommended subreddits.
-        .filter((post) =>
-          allowedSubreddits.has(post.subreddit.toLowerCase())
-        )
-        .filter((post) => isWithinAgeLimit(post.created_utc))
-        .filter((post) => !existingIds.has(post.reddit_post_id))
-        .filter((post) => post.relevance_score >= MIN_RELEVANCE_SCORE);
+      const rawPosts = extractPosts(rawResponse);
+      log.returned = rawPosts.length;
 
-      for (const post of posts) {
+      for (const raw of rawPosts) {
+        const post = normalizePost(
+          raw,
+          step.subreddit,
+          step.query,
+          taskDetails.niche
+        );
+
+        if (!post) {
+          log.unusable += 1;
+          continue;
+        }
+
+        // HARD RULE: post must belong to one of the recommended subreddits.
+        if (!allowedSubreddits.has(post.subreddit.toLowerCase())) {
+          log.wrong_subreddit += 1;
+          continue;
+        }
+
+        if (!isWithinAgeLimit(post.created_utc)) {
+          log.too_old += 1;
+          continue;
+        }
+
+        if (existingIds.has(post.reddit_post_id)) {
+          log.already_saved += 1;
+          continue;
+        }
+
+        if (post.relevance_score < MIN_RELEVANCE_SCORE) {
+          log.low_relevance += 1;
+          bestRejectedScore = Math.max(
+            bestRejectedScore,
+            post.relevance_score
+          );
+          continue;
+        }
+
+        log.accepted += 1;
+
         const previous = candidates.get(post.reddit_post_id);
 
         if (
@@ -527,6 +588,34 @@ async function processTask(env, task) {
           post.relevance_score > previous.relevance_score
         ) {
           candidates.set(post.reddit_post_id, post);
+        }
+      }
+
+      return log;
+    }
+
+    for (const step of plan) {
+      if (callsMade >= MAX_SEARCH_CALLS_PER_RUN) {
+        break;
+      }
+
+      let log = await runSearch(step, step.query);
+
+      // Long natural-language queries often return nothing on Reddit.
+      // If so, retry once with the query's top keywords.
+      if (
+        log.returned === 0 &&
+        !log.error &&
+        callsMade < MAX_SEARCH_CALLS_PER_RUN
+      ) {
+        const shortQuery = shortenQuery(step.query);
+
+        if (
+          shortQuery &&
+          shortQuery.toLowerCase() !== step.query.trim().toLowerCase()
+        ) {
+          await sleep(200);
+          log = await runSearch(step, shortQuery);
         }
       }
 
@@ -574,6 +663,9 @@ async function processTask(env, task) {
       niche: taskDetails.niche || task.niche || null,
       searches_run: callsMade,
       candidates_found: candidates.size,
+      best_rejected_score: bestRejectedScore,
+      min_relevance_score: MIN_RELEVANCE_SCORE,
+      search_log: searchLog,
       saved_count_this_run: savedCount,
       saved_post: saved
         ? {
@@ -622,6 +714,16 @@ function rotate(list, offset) {
   const start = offset % list.length;
 
   return [...list.slice(start), ...list.slice(0, start)];
+}
+
+// Shortens a long query to its first few meaningful keywords,
+// e.g. "how to find my first 10 paying customers" -> "first paying customers".
+function shortenQuery(query) {
+  const words = normalizeText(query)
+    .split(" ")
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+
+  return [...new Set(words)].slice(0, 4).join(" ");
 }
 
 function bestCandidate(candidates) {
