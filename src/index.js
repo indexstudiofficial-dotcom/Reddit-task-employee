@@ -13,7 +13,7 @@ const REDDIT_SEARCH_TOOL = "REDDIT_SEARCH_ACROSS_SUBREDDITS";
 const POSTS_PER_TASK = 5; // total posts a task needs
 const POSTS_PER_RUN = 1; // posts saved per cron run
 const MAX_SEARCH_RESULTS = 100;
-const MAX_POST_AGE_DAYS = 90;
+const MAX_POST_AGE_DAYS = 365; // 1 year
 
 // Relevance (0-100). Posts below this are rejected.
 const MIN_RELEVANCE_SCORE = 45;
@@ -502,6 +502,7 @@ async function processTask(env, task) {
         returned: 0,
         unusable: 0,
         wrong_subreddit: 0,
+        wrong_subreddit_samples: [],
         too_old: 0,
         already_saved: 0,
         low_relevance: 0,
@@ -518,7 +519,10 @@ async function processTask(env, task) {
           connection.connection_id,
           {
             // IMPORTANT: Composio requires search_query, NOT query.
-            search_query: searchText,
+            // "subreddit:name" is Reddit's own search operator. It forces
+            // Reddit to return posts from that subreddit only, even if the
+            // tool ignores the separate subreddit argument.
+            search_query: `subreddit:${step.subreddit} ${searchText}`,
             subreddit: step.subreddit,
             sort: "relevance",
             time_filter: "year",
@@ -557,6 +561,14 @@ async function processTask(env, task) {
         // HARD RULE: post must belong to one of the recommended subreddits.
         if (!allowedSubreddits.has(post.subreddit.toLowerCase())) {
           log.wrong_subreddit += 1;
+
+          if (
+            log.wrong_subreddit_samples.length < 5 &&
+            !log.wrong_subreddit_samples.includes(post.subreddit)
+          ) {
+            log.wrong_subreddit_samples.push(post.subreddit);
+          }
+
           continue;
         }
 
