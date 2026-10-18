@@ -434,6 +434,11 @@ async function processTask(env, task) {
       };
     }
 
+    // Only posts from the task's Recommended Subreddits are allowed.
+    const allowedSubreddits = new Set(
+      taskDetails.subreddits.map((name) => name.toLowerCase())
+    );
+
     // How many posts to save in THIS run (one at a time).
     const wantThisRun = Math.min(POSTS_PER_RUN, remaining);
 
@@ -506,6 +511,10 @@ async function processTask(env, task) {
           )
         )
         .filter(Boolean)
+        // HARD RULE: post must belong to one of the recommended subreddits.
+        .filter((post) =>
+          allowedSubreddits.has(post.subreddit.toLowerCase())
+        )
         .filter((post) => isWithinAgeLimit(post.created_utc))
         .filter((post) => !existingIds.has(post.reddit_post_id))
         .filter((post) => post.relevance_score >= MIN_RELEVANCE_SCORE);
@@ -1021,12 +1030,27 @@ function normalizePost(
     return null;
   }
 
-  const subreddit = normalizeSubreddit(
+  // Use the post's OWN subreddit. Never fall back to the subreddit we
+  // searched, because that would mislabel posts from other subreddits.
+  let rawSubreddit =
     post.subreddit ||
-      post.subreddit_name ||
-      post.subredditName ||
-      fallbackSubreddit
-  );
+    post.subreddit_name ||
+    post.subredditName ||
+    post.subreddit_name_prefixed ||
+    "";
+
+  if (rawSubreddit && typeof rawSubreddit === "object") {
+    rawSubreddit =
+      rawSubreddit.display_name || rawSubreddit.name || "";
+  }
+
+  let subreddit = normalizeSubreddit(rawSubreddit);
+
+  // If the field is missing, read it from the post URL (/r/name/comments/...).
+  if (!subreddit) {
+    const urlMatch = postUrl.match(/\/r\/([^/]+)\/comments\//i);
+    subreddit = urlMatch ? normalizeSubreddit(urlMatch[1]) : "";
+  }
 
   if (!subreddit) {
     return null;
