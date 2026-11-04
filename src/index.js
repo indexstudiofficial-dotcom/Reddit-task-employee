@@ -1,6 +1,19 @@
 // ============================================================
 // REDDIT TASK EMPLOYEE
 // Cloudflare Worker + Supabase + Composio
+//
+// Eligibility rules (checked every cron run, per application):
+//   1. The application's owner has user_subscriptions.subscription_status = 'active'
+//   2. The owner has at least 0.06 credits in users.balance
+//   3. The application has a user_integrations row with
+//      integration_id = 'reddit' and status = 'connected'
+//   4. The application's latest reddit_research_results.created_at is at
+//      least 5 hours old (or the application has never found a post)
+//
+// Among eligible applications, the one whose latest post is OLDEST goes
+// first. One post is found per cron run. 0.06 credits are deducted only
+// when a post is actually saved (charged up front, refunded if no post
+// is saved). If no application is eligible, nothing happens.
 // ============================================================
 
 const WORKER_NAME = "reddit-task-employee";
@@ -26,6 +39,25 @@ const MAX_SEARCH_CALLS_PER_RUN = 10;
 
 // Claim stale processing tasks again after 15 minutes.
 const STALE_TASK_MINUTES = 15;
+
+// ---------- Subscription / credits / cooldown ----------
+const ACTIVE_STATUS = "active";
+const CREDIT_COST = 0.06; // charged per post found
+const USERS_TABLE = "users";
+const USERS_ID_COLUMN = "id";
+const USERS_BALANCE_COLUMN = "balance";
+
+// An application can only find a new post when its latest saved post
+// is at least this old.
+const APPLICATION_COOLDOWN_HOURS = 5;
+
+// If an attempt found nothing (or failed), skip that task for this long so
+// one stuck application can't block the others on every cron run.
+const ATTEMPT_BACKOFF_MINUTES = 30;
+
+// How many pending tasks to look at per run, and per-request id chunk size.
+const MAX_CANDIDATE_TASKS = 100;
+const IN_CHUNK_SIZE = 40;
 
 const STOPWORDS = new Set([
   "the", "and", "for", "are", "but", "not", "you", "all", "any", "can",
@@ -82,30 +114,47 @@ export default {
       }
     }
 
+    // Set once a task is claimed and credits are charged for it.
+    let claimedTask = null;
+    const ctx = { postSaved: false };
+
     try {
       validateEnvironment(env);
 
-      const task = await claimNextTask(env);
+      const claim = await claimNextEligibleTask(env);
 
-      if (!task) {
+      if (!claim.task) {
         return jsonResponse({
           success: true,
           worker: WORKER_NAME,
-          message: "No eligible Reddit tasks found.",
+          message: "No eligible applications. Nothing was done.",
           processed: false,
+          ...claim.summary,
         });
       }
 
-      const result = await processTask(env, task);
+      claimedTask = claim.task;
+
+      const result = await processTask(env, claimedTask, ctx);
+
+      // Credits are only kept when a post was actually saved.
+      if (!ctx.postSaved) {
+        await refundCredits(env, claimedTask.user_id, CREDIT_COST);
+      }
 
       return jsonResponse({
         success: true,
         worker: WORKER_NAME,
         processed: true,
+        credits_charged: ctx.postSaved ? CREDIT_COST : 0,
         ...result,
       });
     } catch (error) {
       console.error("Worker error:", errorMessage(error));
+
+      if (claimedTask && !ctx.postSaved) {
+        await refundCredits(env, claimedTask.user_id, CREDIT_COST);
+      }
 
       return jsonResponse(
         {
@@ -288,39 +337,161 @@ async function supabaseRequest(
   return data;
 }
 
+// Fetches rows where `column` is in `ids`, in chunks so the URL stays short.
+async function fetchInChunks(env, table, column, ids, baseParams) {
+  const rows = [];
+
+  for (let i = 0; i < ids.length; i += IN_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + IN_CHUNK_SIZE);
+
+    const params = new URLSearchParams(baseParams);
+    params.set(
+      column,
+      `in.(${chunk
+        .map((id) => `"${String(id).replace(/"/g, "")}"`)
+        .join(",")})`
+    );
+
+    const data = await supabaseRequest(env, table, {
+      query: params.toString(),
+    });
+
+    if (Array.isArray(data)) {
+      rows.push(...data);
+    }
+  }
+
+  return rows;
+}
+
 // ============================================================
-// CLAIM NEXT TASK
+// CREDITS
 // ============================================================
 
-async function claimNextTask(env) {
-  const staleBefore = new Date(
-    Date.now() - STALE_TASK_MINUTES * 60 * 1000
-  ).toISOString();
+const round4 = (n) => Math.round(n * 10000) / 10000;
 
-  const query = new URLSearchParams({
-    select: "*",
-    worker_type: "eq.reddit_research",
-    source: "eq.reddit",
-    pending_count: "gt.0",
-    order: "created_at.desc",
-    limit: "20",
+async function readBalance(env, userId) {
+  const rows = await supabaseRequest(env, USERS_TABLE, {
+    query: new URLSearchParams({
+      select: USERS_BALANCE_COLUMN,
+      [USERS_ID_COLUMN]: `eq.${userId}`,
+      limit: "1",
+    }).toString(),
   });
 
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+
+  return Number(rows[0][USERS_BALANCE_COLUMN]) || 0;
+}
+
+// Compare-and-swap: only applies if the balance is still what we read,
+// so two simultaneous runs can't spend the same credit.
+async function setBalanceIfUnchanged(env, userId, oldBalance, newBalance) {
+  const updated = await supabaseRequest(env, USERS_TABLE, {
+    method: "PATCH",
+    query: new URLSearchParams({
+      [USERS_ID_COLUMN]: `eq.${userId}`,
+      [USERS_BALANCE_COLUMN]: `eq.${oldBalance}`,
+    }).toString(),
+    body: { [USERS_BALANCE_COLUMN]: newBalance },
+    prefer: "return=representation",
+  });
+
+  return Array.isArray(updated) && updated.length > 0 ? newBalance : null;
+}
+
+// Deducts `amount`. Returns { ok, balance }.
+async function chargeCredits(env, userId, amount) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const balance = await readBalance(env, userId);
+
+    if (balance === null || balance < amount - 1e-9) {
+      return { ok: false, balance: balance || 0 };
+    }
+
+    const result = await setBalanceIfUnchanged(
+      env,
+      userId,
+      balance,
+      round4(balance - amount)
+    );
+
+    if (result !== null) return { ok: true, balance: result };
+  }
+
+  throw new Error("Could not update credits. Please retry.");
+}
+
+// Gives the credit back (no post was saved).
+async function refundCredits(env, userId, amount) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const balance = await readBalance(env, userId);
+      if (balance === null) return;
+
+      const result = await setBalanceIfUnchanged(
+        env,
+        userId,
+        balance,
+        round4(balance + amount)
+      );
+
+      if (result !== null) return;
+    } catch (error) {
+      console.error("Refund error:", errorMessage(error));
+    }
+  }
+
+  console.error("Refund failed after retries for user", userId);
+}
+
+// ============================================================
+// FIND AND CLAIM THE NEXT ELIGIBLE TASK
+// ============================================================
+
+async function claimNextEligibleTask(env) {
+  const now = Date.now();
+
+  const staleBefore = new Date(
+    now - STALE_TASK_MINUTES * 60 * 1000
+  ).toISOString();
+
+  const backoffAfter = now - ATTEMPT_BACKOFF_MINUTES * 60 * 1000;
+  const cooldownCutoff = now - APPLICATION_COOLDOWN_HOURS * 60 * 60 * 1000;
+
+  const summary = {
+    applications_considered: 0,
+    skipped_backoff: 0,
+    skipped_inactive_subscription: 0,
+    skipped_insufficient_credits: 0,
+    skipped_no_reddit_connection: 0,
+    skipped_cooldown: 0,
+  };
+
+  // 1. Candidate tasks (pending, or stuck in processing).
   const tasks = await supabaseRequest(env, "planner_runs", {
-    query: query.toString(),
+    query: new URLSearchParams({
+      select: "*",
+      worker_type: "eq.reddit_research",
+      source: "eq.reddit",
+      pending_count: "gt.0",
+      order: "created_at.desc",
+      limit: String(MAX_CANDIDATE_TASKS),
+    }).toString(),
   });
 
   if (!Array.isArray(tasks) || tasks.length === 0) {
-    return null;
+    return { task: null, summary };
   }
+
+  // One task per application (the newest one).
+  const byApplication = new Map();
 
   for (const task of tasks) {
     const status = asString(task.status).toLowerCase();
 
     const isPending =
-      status === "pending" ||
-      status === "" ||
-      status === "queued";
+      status === "pending" || status === "" || status === "queued";
 
     const isStaleProcessing =
       status === "processing" &&
@@ -328,52 +499,256 @@ async function claimNextTask(env) {
       new Date(task.started_at).getTime() <
         new Date(staleBefore).getTime();
 
-    if (!isPending && !isStaleProcessing) {
+    if (!isPending && !isStaleProcessing) continue;
+    if (!task.user_id || !task.application_id) continue;
+
+    // Recently attempted without a result: let other applications go first.
+    if (
+      isPending &&
+      task.started_at &&
+      new Date(task.started_at).getTime() > backoffAfter
+    ) {
+      summary.skipped_backoff += 1;
       continue;
     }
 
-    // Optimistic claim: only claim if the task still has the
-    // status and pending count that we originally read.
-    const claimQuery = new URLSearchParams({
-      id: `eq.${task.id}`,
-      pending_count: "gt.0",
-    });
+    const key = String(task.application_id);
 
-    if (isPending) {
-      if (status === "") {
-        claimQuery.set("status", "is.null");
-      } else {
-        claimQuery.set("status", `eq.${task.status}`);
-      }
-    } else {
-      claimQuery.set("status", "eq.processing");
-      claimQuery.set("started_at", `lt.${staleBefore}`);
-    }
-
-    const claimed = await supabaseRequest(env, "planner_runs", {
-      method: "PATCH",
-      query: claimQuery.toString(),
-      body: {
-        status: "processing",
-        started_at: new Date().toISOString(),
-        error: null,
-      },
-      prefer: "return=representation",
-    });
-
-    if (Array.isArray(claimed) && claimed.length > 0) {
-      return claimed[0];
+    if (!byApplication.has(key)) {
+      byApplication.set(key, { task, isPending });
     }
   }
 
-  return null;
+  summary.applications_considered = byApplication.size;
+
+  if (byApplication.size === 0) {
+    return { task: null, summary };
+  }
+
+  // 2. Active subscriptions (fails closed: an error here stops the run).
+  const userIds = [
+    ...new Set(
+      [...byApplication.values()].map((e) =>
+        String(e.task.user_id).toLowerCase()
+      )
+    ),
+  ];
+
+  const subscriptionRows = await fetchInChunks(
+    env,
+    "user_subscriptions",
+    "user_id",
+    userIds,
+    {
+      select: "user_id,subscription_status",
+      subscription_status: `ilike.${ACTIVE_STATUS}`,
+    }
+  );
+
+  const activeUsers = new Set(
+    subscriptionRows
+      .filter(
+        (row) =>
+          row.user_id &&
+          asString(row.subscription_status).trim().toLowerCase() ===
+            ACTIVE_STATUS
+      )
+      .map((row) => String(row.user_id).toLowerCase())
+  );
+
+  // 3. Balances.
+  const activeUserIds = userIds.filter((id) => activeUsers.has(id));
+
+  const balanceRows = activeUserIds.length
+    ? await fetchInChunks(env, USERS_TABLE, USERS_ID_COLUMN, activeUserIds, {
+        select: `${USERS_ID_COLUMN},${USERS_BALANCE_COLUMN}`,
+      })
+    : [];
+
+  const balances = new Map(
+    balanceRows.map((row) => [
+      String(row[USERS_ID_COLUMN]).toLowerCase(),
+      Number(row[USERS_BALANCE_COLUMN]) || 0,
+    ])
+  );
+
+  // 4. Subscription + credit filter.
+  let funded = [];
+
+  for (const [applicationId, entry] of byApplication) {
+    const userId = String(entry.task.user_id).toLowerCase();
+
+    if (!activeUsers.has(userId)) {
+      summary.skipped_inactive_subscription += 1;
+      continue;
+    }
+
+    if ((balances.get(userId) ?? 0) < CREDIT_COST - 1e-9) {
+      summary.skipped_insufficient_credits += 1;
+      continue;
+    }
+
+    funded.push([applicationId, entry]);
+  }
+
+  if (funded.length === 0) {
+    return { task: null, summary };
+  }
+
+  // 4b. The application must have a connected Reddit integration.
+  // Row must match this application AND its owner, integration_id "reddit"
+  // and status "connected" with a connection_id.
+  const integrationRows = await fetchInChunks(
+    env,
+    "user_integrations",
+    "application_id",
+    funded.map(([applicationId]) => applicationId),
+    {
+      select: "user_id,application_id,integration_id,connection_id,status",
+      integration_id: "eq.reddit",
+      status: "ilike.connected",
+    }
+  );
+
+  const connectedReddit = new Set(
+    integrationRows
+      .filter(
+        (row) =>
+          row.user_id &&
+          row.application_id &&
+          row.connection_id &&
+          asString(row.integration_id).trim().toLowerCase() === "reddit" &&
+          asString(row.status).trim().toLowerCase() === "connected"
+      )
+      .map(
+        (row) =>
+          `${String(row.user_id).toLowerCase()}|${String(row.application_id)}`
+      )
+  );
+
+  funded = funded.filter(([applicationId, entry]) => {
+    const key = `${String(entry.task.user_id).toLowerCase()}|${applicationId}`;
+
+    if (connectedReddit.has(key)) return true;
+
+    summary.skipped_no_reddit_connection += 1;
+    return false;
+  });
+
+  if (funded.length === 0) {
+    return { task: null, summary };
+  }
+
+  // 5. Latest saved post per application (for cooldown + ordering).
+  // Newest rows come first, so an application missing from the result has
+  // never found a post (or only very old ones) and counts as the oldest.
+  const resultRows = await fetchInChunks(
+    env,
+    "reddit_research_results",
+    "application_id",
+    funded.map(([applicationId]) => applicationId),
+    {
+      select: "application_id,created_at",
+      order: "created_at.desc",
+      limit: "5000",
+    }
+  );
+
+  const lastPostTime = new Map();
+
+  for (const row of resultRows) {
+    const key = String(row.application_id);
+    const time = Date.parse(row.created_at);
+
+    if (!Number.isFinite(time)) continue;
+
+    if (!lastPostTime.has(key) || time > lastPostTime.get(key)) {
+      lastPostTime.set(key, time);
+    }
+  }
+
+  // 6. Cooldown filter, then oldest latest-post first.
+  const eligible = [];
+
+  for (const [applicationId, entry] of funded) {
+    const last = lastPostTime.get(applicationId) ?? 0;
+
+    if (last > cooldownCutoff) {
+      summary.skipped_cooldown += 1;
+      continue;
+    }
+
+    eligible.push({ ...entry, last });
+  }
+
+  eligible.sort((a, b) => a.last - b.last);
+
+  // 7. Charge, then claim. If the claim is lost, refund and try the next.
+  for (const entry of eligible) {
+    const charge = await chargeCredits(env, entry.task.user_id, CREDIT_COST);
+
+    if (!charge.ok) {
+      summary.skipped_insufficient_credits += 1;
+      continue;
+    }
+
+    const claimed = await claimSpecificTask(
+      env,
+      entry.task,
+      entry.isPending,
+      staleBefore
+    );
+
+    if (claimed) {
+      return { task: claimed, summary };
+    }
+
+    await refundCredits(env, entry.task.user_id, CREDIT_COST);
+  }
+
+  return { task: null, summary };
+}
+
+// Optimistic claim: only succeeds if the task still has the status
+// and pending count that we originally read.
+async function claimSpecificTask(env, task, isPending, staleBefore) {
+  const status = asString(task.status).toLowerCase();
+
+  const claimQuery = new URLSearchParams({
+    id: `eq.${task.id}`,
+    pending_count: "gt.0",
+  });
+
+  if (isPending) {
+    if (status === "") {
+      claimQuery.set("status", "is.null");
+    } else {
+      claimQuery.set("status", `eq.${task.status}`);
+    }
+  } else {
+    claimQuery.set("status", "eq.processing");
+    claimQuery.set("started_at", `lt.${staleBefore}`);
+  }
+
+  const claimed = await supabaseRequest(env, "planner_runs", {
+    method: "PATCH",
+    query: claimQuery.toString(),
+    body: {
+      status: "processing",
+      started_at: new Date().toISOString(),
+      error: null,
+    },
+    prefer: "return=representation",
+  });
+
+  return Array.isArray(claimed) && claimed.length > 0 ? claimed[0] : null;
 }
 
 // ============================================================
 // PROCESS TASK
 // ============================================================
 
-async function processTask(env, task) {
+async function processTask(env, task, ctx) {
   try {
     if (!task.user_id) {
       throw new Error("Task is missing user_id.");
@@ -423,7 +798,7 @@ async function processTask(env, task) {
     );
 
     if (remaining === 0) {
-      await updateTaskProgress(env, task, existingPosts.length);
+      await updateTaskProgress(env, task, existingPosts.length, true);
 
       return {
         task_id: task.id,
@@ -661,10 +1036,15 @@ async function processTask(env, task) {
       savedCount = await saveResults(env, task, toSave);
     }
 
+    // A post was really saved: the credit charge is kept.
+    if (savedCount > 0) {
+      ctx.postSaved = true;
+    }
+
     // Re-read results after insertion to calculate the true total.
     const allResults = await getExistingResults(env, task.id);
 
-    await updateTaskProgress(env, task, allResults.length);
+    await updateTaskProgress(env, task, allResults.length, savedCount > 0);
 
     const completed = allResults.length >= POSTS_PER_TASK;
 
@@ -672,6 +1052,7 @@ async function processTask(env, task) {
 
     return {
       task_id: task.id,
+      application_id: task.application_id,
       niche: taskDetails.niche || task.niche || null,
       searches_run: callsMade,
       candidates_found: candidates.size,
@@ -780,10 +1161,7 @@ async function getRedditConnection(
     rows.find((row) => {
       const status = asString(row.status).toLowerCase();
 
-      return (
-        row.connection_id &&
-        (status === "connected" || status === "active")
-      );
+      return row.connection_id && status === "connected";
     }) || null
   );
 }
@@ -1499,9 +1877,13 @@ async function saveResults(env, task, posts) {
 
 // ============================================================
 // UPDATE TASK PROGRESS
+//
+// started_at is cleared when a post was saved. When nothing was found it
+// is set to "now" so the task backs off for ATTEMPT_BACKOFF_MINUTES and
+// other applications get their turn.
 // ============================================================
 
-async function updateTaskProgress(env, task, savedCount) {
+async function updateTaskProgress(env, task, savedCount, foundPostThisRun) {
   const total = Math.min(POSTS_PER_TASK, savedCount);
   const pendingCount = Math.max(0, POSTS_PER_TASK - total);
 
@@ -1516,7 +1898,7 @@ async function updateTaskProgress(env, task, savedCount) {
       pending_count: pendingCount,
       status,
       error: null,
-      started_at: null,
+      started_at: foundPostThisRun ? null : new Date().toISOString(),
     },
     prefer: "return=minimal",
   });
@@ -1536,7 +1918,8 @@ async function markTaskFailed(env, task, message) {
       body: {
         status: "pending",
         error: message.slice(0, 4000),
-        started_at: null,
+        // Back off so a failing application doesn't block the others.
+        started_at: new Date().toISOString(),
       },
       prefer: "return=minimal",
     });
